@@ -252,7 +252,10 @@ def _retry_after_seconds(exc, default=5):
 # No custom (premium) emoji ids are used. All of the look is in NAV_THEME below.
 NAV_TTL = 6 * 3600           # a keyboard state is forgotten after this many seconds
 NAV_MAX_STATES = 5000        # most chats kept in memory
-NAV_MAX_BUTTONS = 60         # Telegram allows about 100; keep the keyboard readable
+NAV_MAX_BUTTONS = 96         # Telegram allows about 100 keys on a keyboard; longer lists are paged (see _paginate)
+NAV_PAGE_SIZE = 8            # list items (rows) on one page of a paged list
+NAV_PAGE_TTL = 1800          # a remembered page number is forgotten after this many seconds without use
+NAV_PAGER_MAX_CHATS = 3000
 NAV_LABEL_MAX = 46
 NAV_BACK_STACK_MAX = 12
 NAV_CANCEL = '❌ Cancel'
@@ -296,6 +299,9 @@ UPDATE_SEEN_TTL = 600
 UPDATE_SEEN = collections.OrderedDict()
 _ACTOR = threading.local()   # who pressed the key that is being handled (set in handle_callbacks)
 NAV_COUNTER_RX = re.compile(r'\(\d+\)')
+_NAV_TRAIL_COUNT_RX = re.compile(r'^(.*?)(?: \(\d+\))?$', re.S)   # "📥 Approvals (3)" -> "📥 Approvals"
+PAGER = {}                   # chat_id -> {list key -> {'page': n, 'time': t}}
+PAGER_LOCK = threading.Lock()
 _NAV_CALL_COUNTER = itertools.count(1)
 _NAV_BACK_RX = re.compile(r'^\W*(?:back|🔙|⬅)', re.I | re.U)
 _NAV_LEAD_RX = re.compile(r'^([^\w\s(\[]+)\s*(.*)$', re.S)
@@ -314,6 +320,8 @@ class NavMenu:
     def __init__(self, row_width=3, **_ignored):
         self.row_width = max(1, int(row_width or 3))
         self.rows = []
+        self.live = None          # zero-argument function that builds this same screen again with fresh numbers
+        self.offset = 0           # numbered keys (1. 2. ...) of a later page continue after this many
 
     def add(self, *buttons, row_width=None):
         width = max(1, int(row_width or self.row_width))
@@ -327,6 +335,61 @@ class NavMenu:
         if buttons:
             self.rows.append(list(buttons))
         return self
+
+    def pager(self, key, view, page, pages):
+        """Prev / Page x/y / Next row of a paged list. `view` is the action that shows the same list again."""
+        if pages <= 1:
+            return self
+        keys = []
+        if page > 0:
+            keys.append(NavButton('⬅️ Prev', callback_data=f'pg_prev|{key}|{view}'))
+        keys.append(NavButton(f'📄 Page {page + 1}/{pages}', callback_data=f'pg_here|{key}|{view}'))
+        if page < pages - 1:
+            keys.append(NavButton('➡️ Next', callback_data=f'pg_next|{key}|{view}'))
+        return self.row(*keys)
+
+
+def _pager_page(chat_id, key):
+    now = time.time()
+    with PAGER_LOCK:
+        ent = (PAGER.get(chat_id) or {}).get(key)
+        if ent and now - ent['time'] <= NAV_PAGE_TTL:
+            return ent['page']
+    return 0
+
+
+def _paginate(chat_id, key, items, size=None):
+    """(items of the current page, page index from 0, number of pages). The remembered page is clamped to the list as it
+    is NOW, so a list that got shorter never shows an empty or missing page."""
+    size = max(1, int(size or NAV_PAGE_SIZE))
+    items = list(items)
+    pages = max(1, -(-len(items) // size))
+    page = min(max(_pager_page(chat_id, key), 0), pages - 1)
+    now = time.time()
+    with PAGER_LOCK:
+        PAGER.setdefault(chat_id, {})[key] = {'page': page, 'time': now}
+        if len(PAGER) > NAV_PAGER_MAX_CHATS:
+            for cid in [c for c, d in PAGER.items() if all(now - e['time'] > NAV_PAGE_TTL for e in d.values())]:
+                PAGER.pop(cid, None)
+            while len(PAGER) > NAV_PAGER_MAX_CHATS:
+                PAGER.pop(next(iter(PAGER)), None)
+    return items[page * size:(page + 1) * size], page, pages
+
+
+def _pager_move(chat_id, key, how):
+    cur = _pager_page(chat_id, key)
+    new = cur + 1 if how == 'next' else cur - 1 if how == 'prev' else cur
+    with PAGER_LOCK:
+        PAGER.setdefault(chat_id, {})[key] = {'page': max(new, 0), 'time': time.time()}
+
+
+def _pager_reset(chat_id):
+    with PAGER_LOCK:
+        PAGER.pop(chat_id, None)
+
+
+def _page_note(page, pages):
+    return f'\n📄 Page {page + 1}/{pages}' if pages > 1 else ''
 
 
 def _nav_split_label(text):
@@ -469,7 +532,7 @@ def _nav_get(chat_id):
 
 
 def _nav_blank():
-    return {'map': {}, 'rows': [], 'time': time.time(), 'cur': None, 'stack': [], 'seq': 0, 'await': False}
+    return {'map': {}, 'rows': [], 'time': time.time(), 'cur': None, 'stack': [], 'seq': 0, 'await': False, 'live': None}
 
 
 def _nav_style_for(label, styles):
@@ -529,16 +592,20 @@ def _nav_rows_to_markup(rows, styles=None):
 
 def _nav_build(chat_id, menu, cancel_only=False):
     """Turn a NavMenu into a ReplyKeyboardMarkup and remember what each label does for this chat."""
-    buttons = [b for row in menu.rows for b in row][:NAV_MAX_BUTTONS]
+    all_buttons = [b for row in menu.rows for b in row]
+    buttons = all_buttons[:NAV_MAX_BUTTONS]
+    if len(all_buttons) > len(buttons):
+        logger.warning("Keyboard has %s keys; only the first %s are shown (a list should be paged)", len(all_buttons), len(buttons))
+    keep = {id(b) for b in buttons}
     main = _nav_is_main_menu(buttons)
     used = set(NAV_RESERVED)
     amap, rows, styles = {}, [], {}
     has_custom_back = False
-    counter = 0
+    counter = int(getattr(menu, 'offset', 0) or 0)
     for row in menu.rows:
         out = []
         for b in row:
-            if b not in buttons:
+            if id(b) not in keep:
                 continue
             action = b.callback_data if b.callback_data is not None else ('url:' + str(b.url))
             if not main and action == 'back_to_main':
@@ -553,7 +620,7 @@ def _nav_build(chat_id, menu, cancel_only=False):
                 has_custom_back = True
             base, n = label, 2
             while label in used:
-                label = f"{base} ({n})"
+                label = f"{base} #{n}"       # not "(2)": that form is what a live counter looks like
                 n += 1
             used.add(label)
             amap[label] = action
@@ -575,7 +642,8 @@ def _nav_build(chat_id, menu, cancel_only=False):
     with NAV_LOCK:
         _nav_forget_old()
         st = NAV_STATE.get(chat_id) or _nav_blank()
-        st.update({'map': amap, 'rows': rows, 'styles': styles, 'time': time.time(), 'await': False})
+        st.update({'map': amap, 'rows': rows, 'styles': styles, 'time': time.time(), 'await': False,
+                   'live': getattr(menu, 'live', None)})
         st['seq'] += 1
         NAV_STATE[chat_id] = st
     return _nav_rows_to_markup(rows, styles)
@@ -588,7 +656,7 @@ def _nav_cancel_menu(chat_id):
         st = NAV_STATE.get(chat_id) or _nav_blank()
         styles = {NAV_CANCEL: 'danger', NAV_HOME: NAV_FALLBACK_STYLE}
         st.update({'map': {NAV_CANCEL: 'nav_cancel', NAV_HOME: 'back_to_main'}, 'rows': rows, 'styles': styles,
-                   'time': time.time(), 'await': True})
+                   'time': time.time(), 'await': True, 'live': None})
         _nav_remember_labels(st['map'])
         st['seq'] += 1
         NAV_STATE[chat_id] = st
@@ -653,10 +721,13 @@ def _nav_lookup(st, text):
                 return action
             text = stripped
     if action is None:
-        # Only a live counter such as "Approvals (3)" may differ in its number. Any other digits must match exactly.
-        norm = NAV_COUNTER_RX.sub('(#)', text)
-        if '(#)' in norm:
-            hits = [a for lab, a in st['map'].items() if NAV_COUNTER_RX.sub('(#)', lab) == norm]
+        # A key of an older keyboard whose live counter differs from today's ("Approvals (2)" while the key now says
+        # "Approvals (5)"): compared without the trailing counter. Exact labels were tried first, every other digit
+        # must match exactly, and the answer must be one single key.
+        if _NAV_TRAIL_COUNT_RX.match(text).group(1) != text:
+            base = _NAV_TRAIL_COUNT_RX.match(text).group(1)
+            hits = [a for lab, a in st['map'].items()
+                    if NAV_COUNTER_RX.search(lab) and _NAV_TRAIL_COUNT_RX.match(lab).group(1) == base]
             if len(hits) == 1:
                 action = hits[0]
     return action
@@ -679,6 +750,80 @@ def _nav_show_main(message, note=None):
         bot.send_message(message.chat.id, note, reply_markup=create_main_menu_inline(uid))
     else:
         _nav_run(message, 'back_to_main')
+
+
+# Screens that open a paged list from the start: opening one of them again shows page 1.
+_PAGER_ENTRY_ACTIONS = ('back_to_main', 'check_files', 'my_running', 'adm_approvals', 'sec_center', 'sec_queue',
+                        'adm_trusted', 'all_users', 'remove_mandatory_channel', 'user_account', 'admin_dashboard')
+
+
+def _nav_live_markup(chat_id, user_id, force=False):
+    """The keyboard to put on a message to this chat so that its numbers (for example Approvals (3)) are the real ones now.
+    It is the fresh build of the screen the person is on, when that screen shows live numbers. Nothing (None) while the
+    chat waits for a typed answer (the Cancel key must stay) or sits on a screen without numbers. A chat the bot knows
+    nothing about (restart) gets the main menu when force is set."""
+    with NAV_LOCK:
+        st = _nav_get(chat_id)
+        if st is not None and st.get('await'):
+            return None
+        builder = st.get('live') if st else None
+    if builder is None:
+        if st is not None or not force:
+            return None
+        def builder(uid=user_id):
+            return create_main_menu_inline(uid)
+    try:
+        return builder()
+    except Exception:
+        logger.exception("Could not build the fresh keyboard for chat %s", chat_id)
+        return None
+
+
+def _nav_refresh_chat(chat_id, user_id, note, force=False):
+    """Send `note` with the fresh keyboard. Returns True when a message went out."""
+    menu = _nav_live_markup(chat_id, user_id, force=force)
+    if menu is None:
+        return False
+    return _safe_send(chat_id, note, reply_markup=menu) is not None
+
+
+def _nav_refresh_admins(note=None, exclude_chat=None):
+    """The Approvals number changed: every admin whose screen shows it gets the fresh keyboard."""
+    note = note or f"🔄 Approvals ab {_pending_count()} hain."
+    for admin_id in sorted(admin_ids):
+        if admin_id == exclude_chat:
+            continue
+        try:
+            _nav_refresh_chat(admin_id, admin_id, note)
+        except Exception:
+            logger.exception("Could not refresh the keyboard of admin %s", admin_id)
+
+
+def _nav_forget_screens(except_chat=None):
+    """After a full restore every remembered screen (file lists, pickers...) may describe things that are gone."""
+    with NAV_LOCK:
+        for cid in list(NAV_STATE):
+            if cid != except_chat:
+                NAV_STATE.pop(cid, None)
+    with PAGER_LOCK:
+        for cid in list(PAGER):
+            if cid != except_chat:
+                PAGER.pop(cid, None)
+
+
+def _nav_page_turn(message, action):
+    """Prev / Next / Page key of a paged list: remember the new page, then show the same list again (fresh data)."""
+    try:
+        head, key, view = action.split('|', 2)
+        how = head[3:]
+    except ValueError:
+        _nav_stale(message)
+        return
+    if how not in ('prev', 'next', 'here') or not view:
+        _nav_stale(message)
+        return
+    _pager_move(message.chat.id, key, how)
+    _nav_run(message, view)
 
 
 def _nav_dispatch(message):
@@ -716,6 +861,14 @@ def _nav_dispatch(message):
         bot.clear_step_handler_by_chat_id(chat_id)        # a key press ends any typed prompt left over
     except Exception:
         pass
+    if action.startswith('pg_'):
+        with NAV_LOCK:
+            if st is not None:
+                st['await'] = False
+        _nav_page_turn(message, action)
+        return
+    if action in _PAGER_ENTRY_ACTIONS:
+        _pager_reset(chat_id)
     if action == 'back_to_main':
         _nav_clear_input(message)
     with NAV_LOCK:
@@ -1033,18 +1186,131 @@ class SafeTeleBot(telebot.TeleBot):
         return self._guard(super().send_sticker, args, kwargs, 'send_sticker')
 
 
+_HTML_TAG_RX = re.compile(r'<(/?)([a-zA-Z][a-zA-Z0-9-]*)[^<>]*>')
+_HTML_PAIRED = ('b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'a', 'tg-spoiler', 'blockquote')
+
+
+def _html_close_open_tags(chunk):
+    """Cut text may end inside a tag or entity, or leave tags open: Telegram then rejects the whole message.
+    Drop a half tag / half entity at the end and close what is still open."""
+    cut = chunk.rfind('<')
+    if cut != -1 and chunk.find('>', cut) == -1:
+        chunk = chunk[:cut]
+    amp = chunk.rfind('&')
+    if amp != -1 and ';' not in chunk[amp:] and len(chunk) - amp <= 10:
+        chunk = chunk[:amp]
+    stack = []
+    for m in _HTML_TAG_RX.finditer(chunk):
+        name = m.group(2).lower()
+        if name not in _HTML_PAIRED:
+            continue
+        if m.group(1):
+            if name in stack:
+                while stack and stack.pop() != name:
+                    pass
+        else:
+            stack.append(name)
+    return chunk + ''.join(f'</{name}>' for name in reversed(stack))
+
+
+def _html_open_tags(chunk):
+    """[(name, raw tag)] of the paired tags still open at the end of `chunk`."""
+    stack = []
+    for m in _HTML_TAG_RX.finditer(chunk):
+        name = m.group(2).lower()
+        if name not in _HTML_PAIRED:
+            continue
+        if m.group(1):
+            for idx in range(len(stack) - 1, -1, -1):
+                if stack[idx][0] == name:
+                    del stack[idx:]
+                    break
+        else:
+            stack.append((name, m.group(0)))
+    return stack
+
+
+def _split_text(text, limit=3900, html=True):
+    """Split a long text into messages of at most `limit` characters, cutting at line ends (a very long line is cut
+    anywhere). With html=True every part is a valid HTML message: tags that were open at the cut are closed there and
+    opened again on the next part. Always returns at least one part."""
+    text = str(text if text is not None else '')
+    limit = max(300, int(limit))
+    if len(text) <= limit:
+        return [text]
+    room = limit - 120                      # space kept for re-opened and closing tags
+    parts, current, carried = [], '', []
+
+    def flush():
+        nonlocal current, carried
+        body, current = current, ''
+        if not body.strip():
+            return
+        if html:
+            chunk = ''.join(raw for _, raw in carried) + body
+            carried = _html_open_tags(chunk)
+            chunk += ''.join(f'</{name}>' for name, _ in reversed(carried))
+        else:
+            chunk = body
+        parts.append(chunk)
+
+    for line in text.split('\n'):
+        while len(line) > room:
+            if current:
+                flush()
+            piece = line[:room]
+            if html:
+                lt = piece.rfind('<')
+                if lt > 0 and piece.find('>', lt) == -1:
+                    piece = piece[:lt]
+            amp = piece.rfind('&')
+            if amp > 0 and ';' not in piece[amp:] and len(piece) - amp <= 10:
+                piece = piece[:amp]
+            current = piece
+            flush()
+            line = line[len(piece):]
+        if current and len(current) + len(line) + 1 > room:
+            flush()
+        current = current + ('\n' if current else '') + line
+    flush()
+    return parts or ['']
+
+
+def _send_long(chat_id, text, reply_markup=None, **kwargs):
+    """Send a long HTML text as several messages (the keyboard goes on the last one). Returns the last message sent."""
+    sent = None
+    parts = _split_text(text)
+    for idx, part in enumerate(parts):
+        extra = dict(kwargs)
+        if reply_markup is not None and idx == len(parts) - 1:
+            extra['reply_markup'] = reply_markup
+        sent = _safe_send(chat_id, part, **extra) or sent
+    return sent
+
+
 def _truncate_text_args(args, kwargs):
-    """Cut an over-long text to Telegram's 4096-character limit."""
+    """Cut an over-long text to Telegram's 4096-character limit (HTML stays valid)."""
     notice = "\n...(shortened)"
+    html = (kwargs.get('parse_mode') or '').upper() == 'HTML'
+
+    def cut(value):
+        head = value[:4096 - len(notice) - 40]
+        if html:
+            nl = head.rfind('\n')
+            if nl > len(head) // 2:
+                head = head[:nl]
+            head = _html_close_open_tags(head)
+        return head + notice
+
     kwargs = dict(kwargs)
     if 'text' in kwargs:
-        kwargs['text'] = str(kwargs['text'])[:4096 - len(notice)] + notice
+        kwargs['text'] = cut(str(kwargs['text']))
         return args, kwargs
     args = list(args)
     # send_message(chat_id, text) / edit_message_text(text, chat_id, message_id)
     for idx, value in enumerate(args):
         if isinstance(value, str) and len(value) > 4000:
-            args[idx] = value[:4096 - len(notice)] + notice
+            args[idx] = cut(value)
             break
     return tuple(args), kwargs
 
@@ -2934,7 +3200,9 @@ def _submit_for_review(user_id, uploader, chat_id, msg_id, file_name, file_type,
                 return None, 'Could not store the file for review. Please try again later.'
         PENDING_REVIEWS[token] = entry
     _review_db_save(entry)
-    # Admins get a plain notice with NO buttons (so their menu keyboard is left alone); they decide in Admin > Approvals.
+    # The notice carries the admin's keyboard built NOW, so "Approvals (n)" shows the new number at once (a reply keyboard
+    # only changes when a message brings a new one). A chat that waits for a typed answer, or sits on a screen without
+    # numbers, is left alone. They decide in Admin > Approvals.
     notice = (f"{THREAT_BADGE[result['level']]} Naya approval: <code>{html_escape(file_name)}</code> "
               f"(user {html_escape(uploader or str(user_id))}). Admin panel > Approvals mein dekho.")
     if kind == 'upload' and file_type == 'zip':
@@ -2942,7 +3210,8 @@ def _submit_for_review(user_id, uploader, chat_id, msg_id, file_name, file_type,
         if source:
             notice += '\n' + source
     for admin_id in sorted(admin_ids):
-        sent = _safe_send(admin_id, notice)
+        menu = _nav_live_markup(admin_id, admin_id, force=True)
+        sent = _safe_send(admin_id, notice, reply_markup=menu) if menu is not None else _safe_send(admin_id, notice)
         if sent is not None:
             entry['admin_msgs'][str(admin_id)] = sent.message_id
     _review_db_save(entry)
@@ -2964,6 +3233,8 @@ def _expire_reviews():
         _review_db_delete(entry['token'])
         _review_edit_all(entry, _review_text(entry, outcome='⌛ Expired, kisi ne decide nahi kiya.'), None)
         _safe_send(entry['chat_id'], f"⌛ <code>{html_escape(entry['file_name'])}</code> ka review time par nahi hua, hata diya. Zarurat ho to dobara upload karo.")
+    if expired:
+        _nav_refresh_admins("⌛ Kuch approvals expire ho gaye, number update ho gaya.")
 
 
 def _deploy_upload(user_id, file_name, file_type, data, reply_obj, result, decision):
@@ -3030,6 +3301,29 @@ def _review_forget(entry):
     _review_db_delete(entry['token'])
 
 
+def _drop_reviews(user_id, file_name=None, why='', kinds=None, notify_user=False, exclude_chat=None):
+    """Remove the waiting reviews of a user (or of one of his files) when the thing they ask about is gone: the user was
+    banned or the hosted file was deleted. Otherwise an admin could approve a file for a banned user, or see an Approve
+    button for a file that no longer exists. The admin buttons are cleared and every admin gets the fresh number."""
+    with REVIEW_LOCK:
+        victims = [item for item in PENDING_REVIEWS.values()
+                   if item['user_id'] == user_id and item['status'] == 'pending'
+                   and (file_name is None or item['file_name'] == file_name)
+                   and (kinds is None or item['kind'] in kinds)]
+    dropped = 0
+    for entry in victims:
+        if _review_claim(entry['token'], 'dropped') is None:
+            continue
+        _review_forget(entry)
+        dropped += 1
+        _review_edit_all(entry, _review_text(entry, outcome=f"🚫 {html_escape(why or 'Hata diya gaya.')}"), None)
+        if notify_user:
+            _safe_send(entry['chat_id'], f"ℹ️ <code>{html_escape(entry['file_name'])}</code> ka review band ho gaya.")
+    if dropped:
+        _nav_refresh_admins(f"🔄 Approvals ab {_pending_count()} hain.", exclude_chat=exclude_chat)
+    return dropped
+
+
 def _review_approve(call, token):
     entry = _review_claim(token)
     if entry is None:
@@ -3077,6 +3371,7 @@ def _review_approve(call, token):
     _review_edit_all(entry, _review_text(entry, outcome=f'✅ Approved by {admin_name}.'), None)
     _safe_send(entry['chat_id'], f"✅ Admin ne <code>{html_escape(entry['file_name'])}</code> approve kar diya, start ho raha hai.")
     _show_approvals(call)
+    _nav_refresh_admins(exclude_chat=call.message.chat.id)
 
 
 def _review_reject(call, token):
@@ -3093,35 +3388,39 @@ def _review_reject(call, token):
     _review_edit_all(entry, _review_text(entry, outcome=f"❌ Rejected by {html_escape(call.from_user.first_name or 'Admin')}."), None)
     _safe_send(entry['chat_id'], f"❌ Admin ne <code>{html_escape(entry['file_name'])}</code> reject kar diya (security). Start nahi hua.")
     _show_approvals(call)
+    _nav_refresh_admins(exclude_chat=call.message.chat.id)
 
 
-def _approvals_view():
-    """Admin list of uploads waiting for a decision: (text, menu)."""
+def _approvals_view(chat_id=None):
+    """Admin list of uploads waiting for a decision: (text, menu). One page (NAV_PAGE_SIZE items) at a time."""
     _expire_reviews()
     with REVIEW_LOCK:
         items = sorted((dict(item) for item in PENDING_REVIEWS.values()), key=lambda item: item['created'])
     kb = NavMenu(row_width=1)
     if items:
-        text = f'<b>📥 Approvals ({len(items)})</b>\nKisi ko kholo, reason padho, phir Approve ya Reject.'
-        for number, item in enumerate(items[:20], 1):
+        shown, page, pages = _paginate(chat_id, 'appr', items)
+        kb.offset = page * NAV_PAGE_SIZE
+        text = f'<b>📥 Approvals ({len(items)})</b>\nKisi ko kholo, reason padho, phir Approve ya Reject.' + _page_note(page, pages)
+        for number, item in enumerate(shown, kb.offset + 1):
             who = (item['uploader'] or str(item['user_id']))[:14]
             kb.add(NavButton(f"{number}. {THREAT_BADGE[item['level']]} {item['file_name'][:22]} - {who}",
                                               callback_data=f"rv_o_{item['token']}"))
-        if len(items) > 20:
-            text += f'\n<i>Pehle 20 dikha raha hoon, total {len(items)}.</i>'
+        kb.pager('appr', 'adm_approvals', page, pages)
     else:
         text = '<b>📥 Approvals (0)</b>\n✅ Kuch pending nahi hai.'
     kb.add(NavButton('🔄 Refresh', callback_data='adm_approvals'))
     kb.add(NavButton('👑 Admin Panel', callback_data='admin_dashboard'))
+    kb.live = lambda cid=chat_id: _approvals_view(cid)[1]
     return text, kb
 
 
 def _show_approvals(call):
-    text, kb = _approvals_view()
+    chat_id = call.message.chat.id
+    text, kb = _approvals_view(chat_id)
     try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
+        bot.edit_message_text(text, chat_id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
     except Exception:
-        _safe_send(call.message.chat.id, text, reply_markup=kb)
+        _safe_send(chat_id, text, reply_markup=kb)
 
 
 def approvals_callback(call):
@@ -3967,6 +4266,8 @@ def create_main_menu_inline(user_id):
                    NavButton('⚙️ Admin Settings', callback_data='admin_settings'))
         markup.row(NavButton('👥 User Management', callback_data='user_management'),
                    NavButton('📢 Broadcast', callback_data='broadcast'))
+    if user_id in admin_ids:
+        markup.live = lambda uid=user_id: create_main_menu_inline(uid)   # Approvals (n) is rebuilt when the keyboard is refreshed
     return markup
 
 
@@ -3976,19 +4277,23 @@ def _file_key_text(file_name, file_type, running, badge):
 
 
 def _files_view(user_id):
-    """(text, NavMenu) for My Files. Export/Import Backup are always on it, even with no files."""
+    """(text, NavMenu) for My Files, one page (NAV_PAGE_SIZE bots) at a time with Prev / Next.
+    Export/Import Backup are always on it, even with no files."""
     files = sorted(user_files.get(user_id, []))
     menu = NavMenu(row_width=1)
-    scan_map = get_scan_map(user_id)
-    for file_name, file_type in files:
+    shown, page, pages = _paginate(user_id, 'files', files)
+    menu.offset = page * NAV_PAGE_SIZE
+    scan_map = get_scan_map(user_id) if shown else {}
+    for file_name, file_type in shown:
         badge = _badge_for(*scan_map[file_name]) if file_name in scan_map else '⚪'
         menu.add(NavButton(_file_key_text(file_name, file_type, is_bot_running(user_id, file_name), badge),
                            callback_data=f'file_{user_id}_{file_name}'))
+    menu.pager('files', 'check_files', page, pages)
     menu.row(NavButton('📦 Export Backup', callback_data=f'ubk_{user_id}'),
              NavButton('♻️ Import Backup', callback_data=f'ubr_{user_id}'))
     menu.row(NavButton('📤 Upload Script', callback_data='upload'))
     if files:
-        text = "📂 Your files:\nTap a file to manage it, or back up / restore all your bots."
+        text = f"📂 Your files ({len(files)}):\nTap a file to manage it, or back up / restore all your bots." + _page_note(page, pages)
     else:
         text = ("📂 Your files:\n\n(No files uploaded yet)\n"
                 "Purana backup hai? Import Backup dabao. Naya hai? Upload Script dabao.")
@@ -5149,6 +5454,29 @@ def _send_safety_backup(chat_id, pre_path, caption):
         logger.exception('Could not send the safety backup')
 
 
+def _restore_done(call, text, full=False):
+    """Final message of a restore. It carries a FRESH main menu: the old keyboard still showed the numbers (Files, Users,
+    Approvals...) from before the restore, and a keyboard only changes when a new message brings one. After a full
+    restore every other remembered screen is dropped (it described the old data) and every other admin gets a fresh menu."""
+    chat_id = call.message.chat.id
+    uid = call.from_user.id
+    if full:
+        _nav_forget_screens()
+    try:
+        menu = create_main_menu_inline(uid)
+    except Exception:
+        logger.exception('Could not build the menu after the restore')
+        menu = None
+    _edit_or_send(call, text, menu)
+    if full:
+        for admin_id in sorted(admin_ids):
+            if admin_id != chat_id:
+                try:
+                    _nav_refresh_chat(admin_id, admin_id, '🔄 Backup restore hua. Menu ke numbers naye hain.', force=True)
+                except Exception:
+                    logger.exception('Could not refresh the menu of admin %s', admin_id)
+
+
 def _confirm_full_restore(call, entry):
     uid = call.from_user.id
     if not _can_backup_global(uid):
@@ -5185,7 +5513,7 @@ def _confirm_full_restore(call, entry):
     if result['missing']:
         lines.append(f'• {result["missing"]} script(s) in the list have no file on disk.')
     lines.append('The state from before the restore was saved and is attached below.')
-    _edit_or_send(call, '\n'.join(lines))
+    _restore_done(call, '\n'.join(lines), full=True)
     _send_safety_backup(call.message.chat.id, result['pre_path'], 'Backup of everything as it was before this restore.')
 
 
@@ -5208,7 +5536,7 @@ def _confirm_user_restore(call, entry):
             f'and {len(user_files.get(owner_id, []))} bot(s) are listed in My Files.\nStart your bots again to use them.')
     if result['pre_path']:
         text += '\nYour previous files were backed up and are attached below.'
-    _edit_or_send(call, text)
+    _restore_done(call, text)
     _send_safety_backup(call.message.chat.id, result['pre_path'], 'Backup of your files as they were before this restore.')
 
 
@@ -5259,6 +5587,7 @@ def create_admin_panel():
     markup.row(NavButton('🤖 AI Security', callback_data='adm_ai'),
                NavButton('🤝 Trusted Users', callback_data='adm_trusted'))
     markup.row(NavButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.live = create_admin_panel
     return markup
 
 def create_user_management_menu():
@@ -8175,12 +8504,16 @@ def my_running_callback(call):
                 rows.append((info.get('file_name', 'Unknown'), key))
         except Exception:
             continue
+    rows.sort(key=lambda r: (str(r[0]).lower(), r[1]))
     kb = NavMenu(row_width=1)
     if rows:
-        for name, key in rows[:40]:
+        shown, page, pages = _paginate(call.message.chat.id, 'running', rows)
+        for name, key in shown:
             owner_part, file_part = key.split('_', 1)
             kb.add(NavButton(f'🟢 {name}', callback_data=f'file_{owner_part}_{file_part}'))
-        body = f"<b>🤖 YOUR RUNNING SCRIPTS</b>\n━━━━━━━━━━━━━━━━━━\n🟢 Active processes: <b>{len(rows)}</b>\n\nSelect a script to open its controls."
+        kb.pager('running', 'my_running', page, pages)
+        body = (f"<b>🤖 YOUR RUNNING SCRIPTS</b>\n━━━━━━━━━━━━━━━━━━\n🟢 Active processes: <b>{len(rows)}</b>\n\n"
+                f"Select a script to open its controls." + _page_note(page, pages))
     else:
         body = "<b>🤖 YOUR RUNNING SCRIPTS</b>\n━━━━━━━━━━━━━━━━━━\nNo scripts are running right now.\n\nUpload a script or start one from My Files."
     kb.add(NavButton('📂 My Files', callback_data='check_files'))
@@ -8691,15 +9024,17 @@ def delete_bot_callback(call):
         if side_path and os.path.isfile(side_path):
             _remove_quietly(side_path)
         remove_user_file_db(script_owner_id, file_name)
-        deleted_str = ", ".join(f"`{f}`" for f in deleted_disk) if deleted_disk else "associated files"
+        _drop_reviews(script_owner_id, file_name, why='File delete ho gayi, review hata diya.', kinds=('existing',),
+                      exclude_chat=chat_id_for_reply)
+        deleted_str = ", ".join(f"<code>{html_escape(f)}</code>" for f in deleted_disk) if deleted_disk else "associated files"
         try:
             bot.edit_message_text(
-                f"🗑️ Record `{file_name}` (User `{script_owner_id}`) and {deleted_str} deleted!",
-                chat_id_for_reply, call.message.message_id, reply_markup=create_main_menu_inline(call.from_user.id), parse_mode='Markdown'
+                f"🗑️ Record <code>{html_escape(file_name)}</code> (User <code>{script_owner_id}</code>) and {deleted_str} deleted!",
+                chat_id_for_reply, call.message.message_id, reply_markup=create_main_menu_inline(call.from_user.id), parse_mode='HTML'
             )
         except Exception as e:
             logger.error(f"Error editing msg after delete: {e}")
-            bot.send_message(chat_id_for_reply, f"🗑️ Record `{file_name}` deleted.", parse_mode='Markdown',
+            bot.send_message(chat_id_for_reply, f"🗑️ Record <code>{html_escape(file_name)}</code> deleted.", parse_mode='HTML',
                              reply_markup=create_main_menu_inline(call.from_user.id))
     except (ValueError, IndexError) as e:
         logger.error(f"Error parsing delete callback '{call.data}': {e}")
@@ -8858,10 +9193,12 @@ def env_callback(call):
                 _env_show_panel(call, owner_id, file_name)
                 return
             markup = NavMenu(row_width=2)
+            shown, page, pages = _paginate(chat_id, 'envd' + _env_key_tag(f'{owner_id}/{file_name}'), sorted(env))
             markup.add(*[NavButton(f"🗑 {key}", callback_data=f'envk_{owner_id}_{_env_key_tag(key)}_{file_name}')
-                         for key in sorted(env)])
+                         for key in shown])
+            markup.pager('envd' + _env_key_tag(f'{owner_id}/{file_name}'), f'envd_{owner_id}_{file_name}', page, pages)
             markup.row(NavButton("🔙 Back", callback_data=f'envm_{owner_id}_{file_name}'))
-            _edit_or_send(call, f"🗑 Which variable of <code>{html_escape(file_name)}</code> should be deleted?", markup)
+            _edit_or_send(call, f"🗑 Which variable of <code>{html_escape(file_name)}</code> should be deleted?" + _page_note(page, pages), markup)
         elif action == 'envk':
             env = load_bot_env(user_folder, file_name)
             key = next((k for k in env if _env_key_tag(k) == key_tag), None)
@@ -9271,7 +9608,15 @@ def execute_broadcast(broadcast_text, photo_id, video_id, caption, admin_chat_id
                   f"🚫 Blocked/Inactive: {blocked_count}\n👥 Targets: {total_users}\n⏱️ Duration: {duration}s")
     logger.info(result_msg.replace("\n", " | "))
     try:
-        bot.send_message(admin_chat_id, result_msg)
+        menu = None
+        try:                                     # fresh keyboard: Approvals (n) may have changed while the broadcast ran
+            menu = _nav_live_markup(admin_chat_id, admin_chat_id, force=True)
+        except Exception:
+            logger.exception("Could not build the menu for the broadcast result")
+        if menu is not None:
+            bot.send_message(admin_chat_id, result_msg, reply_markup=menu)
+        else:
+            bot.send_message(admin_chat_id, result_msg)
     except Exception as e:
         logger.error("Failed to send broadcast result to admin %s: %s", admin_chat_id, e)
 
@@ -9648,11 +9993,12 @@ def aisec_log_callback(call):
 
 
 # --- Trusted users ---
-def _trusted_view():
+def _trusted_view(chat_id=None):
     rows = trusted_list()
-    lines = [f'<b>🤝 Trusted Users ({len(rows)})</b>',
+    shown, page, pages = _paginate(chat_id, 'trusted', rows)
+    lines = [f'<b>🤝 Trusted Users ({len(rows)})</b>' + _page_note(page, pages).replace('\n', ' '),
              'In users ki files ka security scan nahi hota. Sirf unhe do jin par poora bharosa ho.']
-    for user_id, added_by, added_date in rows[:20]:
+    for user_id, added_by, added_date in shown:
         lines.append(f"• <code>{user_id}</code> (by <code>{added_by}</code>, {html_escape(str(added_date)[:10])})")
     audit = trusted_recent_audit(5)
     if audit:
@@ -9661,20 +10007,21 @@ def _trusted_view():
             lines.append(f"{html_escape(ts[5:16])} {'add' if action == 'add' else 'remove'} <code>{user_id}</code> by <code>{actor_id}</code>")
     kb = NavMenu(row_width=2)
     kb.row(NavButton('➕ Trusted add', callback_data='trust_add'), NavButton('➖ Trusted remove', callback_data='trust_remove'))
-    for user_id, _, _ in rows[:10]:
-        kb.add(NavButton(f'🗑 Hatao {user_id}', callback_data=f'trust_rm_{user_id}'))
+    for user_id, _, _ in shown:
+        kb.add(NavButton(f'🗑 Hatao {user_id}', callback_data=f'trust_rm_{user_id}'), row_width=1)
+    kb.pager('trusted', 'adm_trusted', page, pages)
     kb.row(NavButton('👑 Admin Panel', callback_data='admin_panel'))
     return '\n'.join(lines), kb
 
 
 def _trusted_show(chat_id, note=''):
-    text, kb = _trusted_view()
+    text, kb = _trusted_view(chat_id)
     _safe_send(chat_id, (note + '\n\n' if note else '') + text, reply_markup=kb)
 
 
 def trusted_callback(call):
     bot.answer_callback_query(call.id)
-    text, kb = _trusted_view()
+    text, kb = _trusted_view(call.message.chat.id)
     _adm_show(call, text, kb)
 
 
@@ -9818,10 +10165,14 @@ def process_remove_admin_id(message):
 def list_admins_callback(call):
     bot.answer_callback_query(call.id)
     try:
-        admin_list_str = "\n".join(f"- `{aid}` {'(Owner)' if aid == OWNER_ID else ''}" for aid in sorted(list(admin_ids)))
+        admin_list_str = "\n".join(f"- <code>{aid}</code> {'(Owner)' if aid == OWNER_ID else ''}" for aid in sorted(list(admin_ids)))
         if not admin_list_str: admin_list_str = "(No Owner/Admins configured!)"
-        bot.edit_message_text(f"👑 Current Admins:\n\n{admin_list_str}", call.message.chat.id,
-                              call.message.message_id, reply_markup=create_admin_panel(), parse_mode='Markdown')
+        text = f"👑 Current Admins ({len(admin_ids)}):\n\n{admin_list_str}"
+        if len(text) <= 3900:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                  reply_markup=create_admin_panel(), parse_mode='HTML')
+        else:                                    # very long list: several messages, the keyboard on the last one
+            _send_long(call.message.chat.id, text, reply_markup=create_admin_panel(), parse_mode='HTML')
     except Exception as e: logger.error(f"Error listing admins: {e}")
 
 def add_subscription_init_callback(call):
@@ -9945,6 +10296,7 @@ def process_ban_user(message):
         
         if ban_user_db(user_id, reason, admin_id):
             bot.reply_to(message, f"✅ User `{user_id}` banned.\nReason: {reason}")
+            _drop_reviews(user_id, why='User ban ho gaya, review hata diya.', exclude_chat=message.chat.id)
             # Stop all scripts for banned user
             for file_name, _ in user_files.get(user_id, []):
                 script_key = f"{user_id}_{file_name}"
@@ -10070,78 +10422,55 @@ def process_user_info(message):
         logger.error(f"Error getting user info: {e}", exc_info=True)
         bot.reply_to(message, f"❌ Error: {str(e)}")
 
+USERS_PAGE_SIZE = 20
+
+
+def _users_view(chat_id=None):
+    """Active users list, USERS_PAGE_SIZE per page: (text, menu). The text carries the users, so the page is long."""
+    users_list = sorted(active_users)
+    back = NavButton("🔙 Back to User Management", callback_data='user_management')
+    if not users_list:
+        return "👥 No active users yet.", NavMenu(row_width=1).add(back)
+    shown, page, pages = _paginate(chat_id, 'users', users_list, size=USERS_PAGE_SIZE)
+    start = page * USERS_PAGE_SIZE
+    lines = [f"👥 <b>Active Users</b> ({len(users_list)}) - Page {page + 1}/{pages}", ""]
+    now = datetime.now()
+    for i, user_id in enumerate(shown, start + 1):
+        if user_id == OWNER_ID: status = "👑"
+        elif user_id in admin_ids: status = "🛡️"
+        elif user_id in banned_users: status = "🚫"
+        elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > now:
+            status = "⭐"
+        else: status = "🆓"
+        lines.append(f"{i}. <code>{user_id}</code> {status}")
+    markup = NavMenu(row_width=1)
+    markup.pager('users', 'all_users', page, pages)
+    markup.row(back)
+    markup.live = lambda cid=chat_id: _users_view(cid)[1]
+    return "\n".join(lines), markup
+
+
 def all_users_callback(call):
     bot.answer_callback_query(call.id)
     try:
-        if not active_users:
-            bot.edit_message_text("👥 No active users yet.", call.message.chat.id, call.message.message_id)
-            return
-        
-        users_list = sorted(active_users)
-        chunk_size = 20
-        total_pages = (len(users_list) + chunk_size - 1) // chunk_size
-        
-        # Create pagination
-        current_page = 0
-        display_users_list(call.message.chat.id, call.message.message_id, users_list, current_page, total_pages, chunk_size)
-        
+        text, markup = _users_view(call.message.chat.id)
+        _adm_show(call, text, markup)
     except Exception as e:
         logger.error(f"Error displaying all users: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "Error displaying users.", show_alert=True)
 
-def display_users_list(chat_id, message_id, users_list, page, total_pages, chunk_size):
-    start_idx = page * chunk_size
-    end_idx = min(start_idx + chunk_size, len(users_list))
-    
-    user_chunk = users_list[start_idx:end_idx]
-    
-    message_text = f"👥 **Active Users** (Page {page + 1}/{total_pages})\n\n"
-    for i, user_id in enumerate(user_chunk, start=start_idx + 1):
-        status = ""
-        if user_id == OWNER_ID: status = "👑"
-        elif user_id in admin_ids: status = "🛡️"
-        elif user_id in banned_users: status = "🚫"
-        elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > datetime.now():
-            status = "⭐"
-        else: status = "🆓"
-        
-        message_text += f"{i}. `{user_id}` {status}\n"
-    
-    markup = NavMenu(row_width=3)
-    
-    if total_pages > 1:
-        page_buttons = []
-        if page > 0:
-            page_buttons.append(NavButton("⬅️ Previous", callback_data=f"users_page_{page-1}"))
-        
-        page_buttons.append(NavButton(f"📄 {page+1}/{total_pages}", callback_data="noop"))
-        
-        if page < total_pages - 1:
-            page_buttons.append(NavButton("➡️ Next", callback_data=f"users_page_{page+1}"))
-        
-        markup.row(*page_buttons)
-    
-    markup.row(NavButton("🔙 Back to User Management", callback_data='user_management'))
-    
-    try:
-        bot.edit_message_text(message_text, chat_id, message_id, reply_markup=markup, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error editing users list: {e}")
 
 def handle_users_page(call):
+    """Old inline 'users_page_N' button (an old message still on screen): show that page of the list."""
     if call.from_user.id not in admin_ids:
         bot.answer_callback_query(call.id, "⚠️ Admin only.", show_alert=True)
         return
-    
     try:
-        page = int(call.data.split('_')[2])
-        users_list = sorted(active_users)
-        chunk_size = 20
-        total_pages = (len(users_list) + chunk_size - 1) // chunk_size
-        
+        page = max(0, int(call.data.split('_')[2]))
         bot.answer_callback_query(call.id)
-        if 0 <= page < total_pages:
-            display_users_list(call.message.chat.id, call.message.message_id, users_list, page, total_pages, chunk_size)
+        with PAGER_LOCK:
+            PAGER.setdefault(call.message.chat.id, {})['users'] = {'page': page, 'time': time.time()}
+        all_users_callback(call)
     except Exception as e:
         logger.error(f"Error handling users page: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "Error.", show_alert=True)
@@ -10806,15 +11135,17 @@ def remove_mandatory_channel_callback(call):
     bot.answer_callback_query(call.id)
     
     markup = NavMenu()
-    for channel_id, channel_info in list(mandatory_channels.items()):
+    shown, page, pages = _paginate(call.message.chat.id, 'rmchan', list(mandatory_channels.items()))
+    markup.offset = page * NAV_PAGE_SIZE
+    for channel_id, channel_info in shown:
         channel_name = channel_info.get('name', 'Unknown')
         button_text = f"🗑️ {channel_name}"
-        markup.add(NavButton(button_text, callback_data=f'remove_channel_{channel_id}'))
-    
+        markup.add(NavButton(button_text, callback_data=f'remove_channel_{channel_id}'), row_width=1)
+    markup.pager('rmchan', 'remove_mandatory_channel', page, pages)
     markup.add(NavButton("🔙 Back", callback_data='manage_mandatory_channels'))
     
     try:
-        bot.edit_message_text("📢 Choose channel to delete:",
+        bot.edit_message_text("📢 Choose channel to delete:" + _page_note(page, pages),
                               call.message.chat.id, call.message.message_id, 
                               reply_markup=markup)
     except Exception as e:
@@ -10829,9 +11160,9 @@ def process_remove_channel(call):
         if remove_mandatory_channel_db(channel_id):
             bot.answer_callback_query(call.id, f"✅ Channel deleted: {channel_name}")
             try:
-                bot.edit_message_text(f"✅ Mandatory channel deleted: **{channel_name}**",
+                bot.edit_message_text(f"✅ Mandatory channel deleted: <b>{html_escape(str(channel_name))}</b>",
                                       call.message.chat.id, call.message.message_id,
-                                      reply_markup=create_mandatory_channels_menu(), parse_mode='Markdown')
+                                      reply_markup=create_mandatory_channels_menu(), parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Error updating message after channel removal: {e}")
         else:
