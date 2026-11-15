@@ -281,11 +281,16 @@ NAV_NUMBERED_PREFIXES = ('file_', 'rv_', 'remove_channel_')
 NAV_STATE = {}
 NAV_LOCK = threading.RLock()
 # Guards against an option switching on by itself (see _nav_wrap_next_step / _nav_dispatch):
-STEP_TTL = 900               # a typed-answer prompt is forgotten after this many seconds
+STEP_TTL = 120               # a typed-answer prompt is forgotten after this many seconds
 NAV_KNOWN_LABELS = {}        # every key label that was ever shown -> last time; separates an old key from a typed answer
 NAV_KNOWN_MAX = 4000
 NAV_SEEN_MAX = 200           # message ids remembered per chat to drop a re-delivered key press
+NAV_SEEN_TTL = 600           # ... and for how many seconds
 NAV_SEEN = {}
+UPDATE_SEEN_MAX = 2000       # update ids remembered to drop a re-delivered update
+UPDATE_SEEN_TTL = 600
+UPDATE_SEEN = collections.OrderedDict()
+_ACTOR = threading.local()   # who pressed the key that is being handled (set in handle_callbacks)
 NAV_COUNTER_RX = re.compile(r'\(\d+\)')
 _NAV_CALL_COUNTER = itertools.count(1)
 _NAV_BACK_RX = re.compile(r'^\W*(?:back|🔙|⬅)', re.I | re.U)
@@ -412,24 +417,41 @@ def _nav_is_old_key(text):
 
 
 def _msg_already_seen(message):
-    """True when this exact Telegram message was already handled (a re-delivered update). Fake key calls have
-    negative ids and are never dropped."""
+    """True when this exact Telegram message was already handled a moment ago (a re-delivered update). Fake key
+    calls have negative ids and are never dropped."""
     try:
         mid = message.message_id
         if not isinstance(mid, int) or mid <= 0:
             return False
         key = (message.chat.id, mid)
+        now = time.time()
         with NAV_LOCK:
             seen = NAV_SEEN.setdefault(message.chat.id, collections.OrderedDict())
-            if key in seen:
+            if now - seen.get(key, -NAV_SEEN_TTL) < NAV_SEEN_TTL:
                 return True
-            seen[key] = True
-            while len(seen) > NAV_SEEN_MAX:
+            seen[key] = now
+            seen.move_to_end(key)
+            while len(seen) > NAV_SEEN_MAX or (seen and now - next(iter(seen.values())) > NAV_SEEN_TTL):
                 seen.popitem(last=False)
             if len(NAV_SEEN) > NAV_MAX_STATES:
                 NAV_SEEN.pop(next(iter(NAV_SEEN)), None)
     except Exception:
         return False
+    return False
+
+
+def _update_already_seen(update_id):
+    """True when Telegram delivered this update_id a second time (polling restart, a second instance)."""
+    if not isinstance(update_id, int):
+        return False
+    now = time.time()
+    with NAV_LOCK:
+        if now - UPDATE_SEEN.get(update_id, -UPDATE_SEEN_TTL) < UPDATE_SEEN_TTL:
+            return True
+        UPDATE_SEEN[update_id] = now
+        UPDATE_SEEN.move_to_end(update_id)
+        while len(UPDATE_SEEN) > UPDATE_SEEN_MAX or (UPDATE_SEEN and now - next(iter(UPDATE_SEEN.values())) > UPDATE_SEEN_TTL):
+            UPDATE_SEEN.popitem(last=False)
     return False
 
 
@@ -686,8 +708,16 @@ def _nav_dispatch(message):
     if action.startswith('url:'):
         bot.send_message(chat_id, action[4:], disable_web_page_preview=False)
         return
+    try:
+        bot.clear_step_handler_by_chat_id(chat_id)        # a key press ends any typed prompt left over
+    except Exception:
+        pass
+    if action == 'back_to_main':
+        _nav_clear_input(message)
     with NAV_LOCK:
         st = NAV_STATE.get(chat_id)
+        if st is not None:
+            st['await'] = False
         if action == 'nav_back':
             action = st['stack'].pop() if st and st['stack'] else 'back_to_main'
             if st:
@@ -705,7 +735,11 @@ def _nav_dispatch(message):
 
 
 def _nav_clear_input(message):
-    """Forget a half-finished typed input (Cancel pressed)."""
+    """Forget a half-finished typed input (Cancel, Home or /start pressed)."""
+    with NAV_LOCK:
+        st = NAV_STATE.get(message.chat.id)
+        if st is not None:
+            st['await'] = False
     try:
         bot.clear_step_handler_by_chat_id(message.chat.id)
     except Exception:
@@ -725,22 +759,34 @@ def _nav_stale(message):
     chat_id = message.chat.id
     st = _nav_get(chat_id)
     note = "Ye option ab available nahi hai. Neeche ke buttons se chuno 👇"
+    if st and st.get('await'):
+        with NAV_LOCK:
+            st['await'] = False                          # nothing is waiting for an answer any more
+        st = None
     if st and st.get('rows'):
         bot.send_message(chat_id, note, reply_markup=_nav_rows_to_markup(st['rows'], st.get('styles')))
     else:
         bot.send_message(chat_id, note, reply_markup=create_main_menu_inline(message.from_user.id))
 
 
-def _nav_wrap_next_step(callback):
+def _nav_wrap_next_step(callback, owner=None):
     """A typed answer normally goes to the waiting step; a key label, Cancel or a /command re-routes.
     A prompt that waited longer than STEP_TTL, or a key label from an old keyboard, is never taken as the answer:
-    that is how a forgotten prompt used to switch an option on later without any click."""
+    that is how a forgotten prompt used to switch an option on later without any click.
+    In a group only the person who started the prompt can answer it."""
     registered = time.time()
 
     def wrapped(message, *a, **kw):
         text = getattr(message, 'text', None)
         chat_id = message.chat.id
         expired = time.time() - registered > STEP_TTL
+        if (owner is not None and message.from_user.id != owner and getattr(message.chat, 'type', 'private') != 'private'
+                and not expired):
+            # somebody else talking in the group: handle it normally and keep waiting for the right person
+            bot.process_new_messages([message])
+            if not bot.next_step_backend.handlers.get(chat_id):
+                bot.next_step_backend.register_handler(chat_id, {'callback': wrapped, 'args': (), 'kwargs': {}})
+            return
         if text:
             st = _nav_get(chat_id)
             if text == NAV_CANCEL or text == NAV_HOME or text.startswith('/') or _nav_lookup(st, text) is not None:
@@ -753,7 +799,16 @@ def _nav_wrap_next_step(callback):
                 else:
                     _nav_dispatch(message)
                 return
-            if _nav_is_old_key(text):
+            if message.chat.type == 'private' and text in BUTTON_TEXT_TO_LOGIC and text not in LEGACY_TEXT_NEEDS_MENU:
+                # an exact label of a harmless old key: the prompt is dropped and that key runs, it is never the answer
+                try:
+                    bot.clear_step_handler_by_chat_id(chat_id)
+                except Exception:
+                    pass
+                _nav_clear_input(message)
+                bot.process_new_messages([message])
+                return
+            if text in LEGACY_TEXT_NEEDS_MENU or _nav_is_old_key(text):
                 # a key of an older keyboard, not an answer: forget the prompt and put the keyboard back
                 try:
                     bot.clear_step_handler_by_chat_id(chat_id)
@@ -770,13 +825,17 @@ def _nav_wrap_next_step(callback):
                 pass
             _nav_clear_input(message)
             logger.info("Expired prompt dropped in chat %s", chat_id)
-            if text:
-                _nav_stale(message)
+            if text and message.chat.type == 'private':
+                _nav_show_main(message, "⌛ Ye jawab bahut der baad aaya, isliye use nahi liya. Dobara button dabao.")
             else:
                 bot.process_new_messages([message])
             return
         before = (_nav_get(chat_id) or {}).get('seq', 0)
-        result = callback(message, *a, **kw)
+        _ACTOR.uid = message.from_user.id
+        try:
+            result = callback(message, *a, **kw)
+        finally:
+            _ACTOR.uid = None
         st = _nav_get(chat_id)
         if st is None or st.get('seq', 0) == before or st.get('await'):
             try:
@@ -921,7 +980,20 @@ class SafeTeleBot(telebot.TeleBot):
             _nav_offer_cancel(message)
         except Exception:
             logger.exception("Could not show the Cancel key")
-        return super().register_next_step_handler(message, _nav_wrap_next_step(callback), *args, **kwargs)
+        # one prompt per chat: an older unanswered prompt must never fire together with (or instead of) this one
+        try:
+            self.clear_step_handler_by_chat_id(message.chat.id)
+        except Exception:
+            pass
+        return super().register_next_step_handler(
+            message, _nav_wrap_next_step(callback, getattr(_ACTOR, 'uid', None)), *args, **kwargs)
+
+    def process_new_updates(self, updates):
+        """An update that was already handled (same update_id) is dropped."""
+        fresh = [u for u in updates if not _update_already_seen(getattr(u, 'update_id', None))]
+        if len(fresh) != len(updates):
+            logger.info("Dropped %s re-delivered update(s)", len(updates) - len(fresh))
+        return super().process_new_updates(fresh)
 
     def send_document(self, *args, **kwargs):
         args, kwargs = self._nav_args(args, kwargs)
@@ -1739,6 +1811,95 @@ _AI_USER_CALLS = {}                      # user id -> deque of recent call times
 _AI_STATE = {'fails': 0, 'pause_until': 0.0}
 _AI_BAD_KEY_RX = re.compile(r'\s')
 
+# Providers that speak the OpenAI chat format. The key prefix tells which one a key belongs to.
+AI_PROVIDERS = {
+    'nvidia': {'name': 'NVIDIA', 'url': 'https://integrate.api.nvidia.com/v1', 'model': 'meta/llama-3.1-70b-instruct',
+               'example': 'meta/llama-3.1-70b-instruct'},
+    'openai': {'name': 'OpenAI', 'url': 'https://api.openai.com/v1', 'model': 'gpt-4o-mini', 'example': 'gpt-4o-mini'},
+    'openrouter': {'name': 'OpenRouter', 'url': 'https://openrouter.ai/api/v1', 'model': 'meta-llama/llama-3.1-70b-instruct',
+                   'example': 'meta-llama/llama-3.1-70b-instruct'},
+    'groq': {'name': 'Groq', 'url': 'https://api.groq.com/openai/v1', 'model': 'llama-3.3-70b-versatile',
+             'example': 'llama-3.3-70b-versatile'},
+    'gemini': {'name': 'Gemini', 'url': 'https://generativelanguage.googleapis.com/v1beta/openai', 'model': 'gemini-2.0-flash',
+               'example': 'gemini-2.0-flash'},
+}
+AI_KEY_PREFIXES = (('nvapi-', 'nvidia'), ('sk-or-', 'openrouter'), ('gsk_', 'groq'), ('sk-ant-', 'anthropic'), ('AIza', 'gemini'))
+# words that are the name of a company or family, never a model name
+AI_PROVIDER_WORDS = frozenset({'nvidia', 'nim', 'nvidianim', 'openai', 'chatgpt', 'gpt', 'groq', 'openrouter', 'gemini', 'google',
+                               'anthropic', 'claude', 'meta', 'mistral', 'deepseek', 'custom', 'llama', 'default', 'model'})
+AI_MODELS_SHOWN = 20
+AI_MODELS_MAX_BYTES = 1024 * 1024
+AI_DETAIL_MAX = 140
+AI_JSON_MODE_HOSTS = ('api.openai.com', 'api.groq.com')
+
+
+def _ai_detect_provider(key):
+    """Provider id for a key: 'nvidia', 'openrouter', 'groq', 'gemini', 'anthropic' (not usable here) or 'openai'."""
+    key = (key or '').strip()
+    for prefix, provider in AI_KEY_PREFIXES:
+        if key.startswith(prefix):
+            return provider
+    return 'openai'
+
+
+def _ai_provider_of_url(url):
+    """Provider id whose server this URL is, else ''."""
+    host = (urlsplit(url or '').hostname or '').lower()
+    for pid, info in AI_PROVIDERS.items():
+        if urlsplit(info['url']).hostname == host:
+            return pid
+    return ''
+
+
+def _ai_provider_label(url):
+    pid = _ai_provider_of_url(url)
+    return AI_PROVIDERS[pid]['name'] if pid else 'Custom'
+
+
+def _ai_model_is_provider_name(name):
+    return re.sub(r'[\s_\-.]+', '', (name or '').lower()) in AI_PROVIDER_WORDS
+
+
+def _ai_model_ok(name):
+    """True when the text can be a model name (right characters, and not just the name of a company)."""
+    return bool(re.fullmatch(r'[A-Za-z0-9._:/\-]{2,100}', name or '')) and not _ai_model_is_provider_name(name)
+
+
+def _ai_model_misfit(provider, model):
+    """A name that is clearly for another provider (an OpenAI name on a server that does not host it)."""
+    low = (model or '').lower()
+    return provider not in ('', 'openai') and low.startswith(('gpt-', 'chatgpt', 'text-', 'o1', 'o3')) and '/' not in low
+
+
+def ai_autosetup(migrate=False):
+    """Fill in the server and a working model from the key. Returns a list of short notes about what was set.
+    migrate=False (a key was just entered): also sets a model when none is saved.
+    migrate=True (panel opened / Test pressed): only repairs the known wrong mix, an NVIDIA-style key on the default
+    OpenAI server, or a model that is not a model name. Never touches a custom server."""
+    with AI_LOCK:
+        cfg = ai_config_get()
+        key = cfg['api_key']
+        if not key:
+            return []
+        provider = _ai_detect_provider(key)
+        if provider == 'anthropic':
+            return []
+        notes, changes = [], {}
+        url = cfg['base_url']
+        if url == AI_DEFAULTS['base_url'] and provider != 'openai':
+            url = changes['base_url'] = AI_PROVIDERS[provider]['url']
+            notes.append(f"Server {AI_PROVIDERS[provider]['name']} par set kiya")
+        server = _ai_provider_of_url(url)
+        model = cfg['model']
+        bad = (not model and not migrate) or (model and (not _ai_model_ok(model) or _ai_model_misfit(server, model)))
+        if server and bad:
+            changes['model'] = AI_PROVIDERS[server]['model']
+            notes.append(f"Model {changes['model']} set kiya")
+        if changes:
+            ai_config_update(**changes)
+            logger.warning('AI settings auto-set for provider %s', AI_PROVIDERS.get(server, {}).get('name', '?'))
+        return notes
+
 
 def _ai_clean_url(url):
     """https only (plain http only for a local server). Returns the cleaned URL or ''."""
@@ -2049,29 +2210,120 @@ def _ai_parse(text, names):
     return {'overall': overall, 'confidence': conf_of(raw.get('confidence')), 'reason': reason, 'files': files}
 
 
-def _ai_call(cfg, messages):
-    """One request to an OpenAI-style chat endpoint. Returns (reply text or None, status code string)."""
-    url = cfg['base_url'] + '/chat/completions'
+def _ai_clean_detail(text):
+    """A short, safe piece of the provider's own error text: no key, no markup, no control characters."""
+    text = redact_secrets(re.sub(r'[\x00-\x1f\x7f<>]', ' ', str(text or '')))
+    return re.sub(r'\s+', ' ', text).strip()[:AI_DETAIL_MAX]
+
+
+def _ai_error_detail(raw):
+    """The message inside an error answer ({"error": {"message": ...}} and similar), cleaned. '' when none."""
+    text = raw.decode('utf-8', 'replace') if isinstance(raw, (bytes, bytearray)) else str(raw or '')
     try:
-        resp = requests.post(url, headers={'Authorization': 'Bearer ' + cfg['api_key'], 'Content-Type': 'application/json'},
-                             json={'model': cfg['model'], 'messages': messages, 'temperature': 0, 'max_tokens': 700},
+        data = json.loads(text)
+    except ValueError:
+        return _ai_clean_detail(text)
+    if isinstance(data, list) and data:
+        data = data[0]
+    if isinstance(data, dict):
+        err = data.get('error', data)
+        if isinstance(err, dict):
+            err = err.get('message') or err.get('detail') or err.get('error') or ''
+        return _ai_clean_detail(err or data.get('detail') or data.get('message') or '')
+    return _ai_clean_detail(data)
+
+
+def _ai_headers(cfg):
+    return {'Authorization': 'Bearer ' + cfg['api_key'], 'Content-Type': 'application/json'}
+
+
+def _ai_read_error_body(resp, limit=4096):
+    try:
+        return next(resp.iter_content(limit), b'')
+    except (requests.RequestException, StopIteration, TypeError):
+        return b''
+
+
+def _ai_post_once(cfg, messages, use_format, info):
+    """One POST. Returns (reply, status). On an HTTP error info['detail'] gets the provider's short message."""
+    body = {'model': cfg['model'], 'messages': messages, 'temperature': 0, 'max_tokens': 700}
+    if use_format:
+        body['response_format'] = {'type': 'json_object'}
+    try:
+        resp = requests.post(cfg['base_url'] + '/chat/completions', headers=_ai_headers(cfg), json=body,
                              timeout=(6, cfg['timeout']), allow_redirects=False, stream=True)
     except requests.Timeout:
         return None, 'timeout'
-    except requests.RequestException as exc:
+    except requests.exceptions.SSLError:
+        return None, 'ssl'
+    except requests.RequestException:
         return None, 'network'
     try:
         if resp.status_code != 200:
+            info['detail'] = _ai_error_detail(_ai_read_error_body(resp))
             return None, f'http_{resp.status_code}'
-        body, size = [], 0
+        body_parts, size = [], 0
         for chunk in resp.iter_content(65536):
             size += len(chunk)
             if size > AI_MAX_REPLY_BYTES:
                 return None, 'too_big'
-            body.append(chunk)
-        data = json.loads(b''.join(body).decode('utf-8', 'replace'))
+            body_parts.append(chunk)
+        data = json.loads(b''.join(body_parts).decode('utf-8', 'replace'))
         return data['choices'][0]['message']['content'], 'ok'
     except (ValueError, KeyError, IndexError, TypeError, requests.RequestException):
+        return None, 'bad_reply'
+    finally:
+        resp.close()
+
+
+def _ai_call(cfg, messages, info=None):
+    """One request to an OpenAI-style chat endpoint. Returns (reply text or None, status code string).
+    JSON mode (response_format) is only asked from servers known to accept it; when a server answers 400 because of it,
+    the request is repeated once without it (the answer is read as plain text anyway).
+    info (optional dict) receives 'detail' = the provider's own short error message."""
+    info = info if info is not None else {}
+    use_format = (urlsplit(cfg['base_url']).hostname or '') in AI_JSON_MODE_HOSTS
+    reply, status = _ai_post_once(cfg, messages, use_format, info)
+    detail = (info.get('detail') or '').lower()
+    if status == 'http_400' and use_format and (not detail or 'response_format' in detail or 'json' in detail):
+        info.pop('detail', None)
+        reply, status = _ai_post_once(cfg, messages, False, info)
+    return reply, status
+
+
+def _ai_list_models(cfg, info=None):
+    """GET {base}/models. Returns (sorted list of model ids or None, status)."""
+    info = info if info is not None else {}
+    try:
+        resp = requests.get(cfg['base_url'] + '/models', headers=_ai_headers(cfg), timeout=(6, cfg['timeout']),
+                            allow_redirects=False, stream=True)
+    except requests.Timeout:
+        return None, 'timeout'
+    except requests.exceptions.SSLError:
+        return None, 'ssl'
+    except requests.RequestException:
+        return None, 'network'
+    try:
+        if resp.status_code != 200:
+            info['detail'] = _ai_error_detail(_ai_read_error_body(resp))
+            return None, f'http_{resp.status_code}'
+        parts, size = [], 0
+        for chunk in resp.iter_content(65536):
+            size += len(chunk)
+            if size > AI_MODELS_MAX_BYTES:
+                return None, 'too_big'
+            parts.append(chunk)
+        data = json.loads(b''.join(parts).decode('utf-8', 'replace'))
+        items = data.get('data', data.get('models')) if isinstance(data, dict) else data
+        names = []
+        for item in items:
+            raw = item.get('id') or item.get('name') if isinstance(item, dict) else item
+            if isinstance(raw, str):
+                raw = raw[7:] if raw.startswith('models/') else raw
+                if re.fullmatch(r'[A-Za-z0-9._:/\-]{2,100}', raw):
+                    names.append(raw)
+        return sorted(set(names)), 'ok'
+    except (ValueError, KeyError, TypeError, AttributeError, requests.RequestException):
         return None, 'bad_reply'
     finally:
         resp.close()
@@ -7146,12 +7398,28 @@ def process_admin_install(message):
         bot.reply_to(message, f"❌ Error: {str(e)}")
 
 # --- Command Handlers & Text Handlers for ReplyKeyboard ---
+def _nav_reset_chat(message):
+    """/start and /cancel: forget every half-finished prompt, picker and screen history of this chat."""
+    _nav_clear_input(message)
+    with NAV_LOCK:
+        st = NAV_STATE.get(message.chat.id)
+        if st is not None:
+            st.update({'stack': [], 'cur': None, 'await': False})
+
+
 @bot.message_handler(commands=['start', 'help'])
 def command_send_welcome(message): 
     if message.text == '/help':
         _logic_help(message)
     else:
+        _nav_reset_chat(message)
         _logic_send_welcome(message)
+
+
+@bot.message_handler(commands=['cancel'])
+def command_cancel(message):
+    _nav_reset_chat(message)
+    _nav_show_main(message, "❎ Cancel ho gaya.")
 
 @bot.message_handler(commands=['account'])
 def command_account(message):
@@ -7470,6 +7738,14 @@ def legacy_inline_callback(call):
 
 
 def handle_callbacks(call):
+    _ACTOR.uid = call.from_user.id
+    try:
+        _handle_callbacks(call)
+    finally:
+        _ACTOR.uid = None
+
+
+def _handle_callbacks(call):
     user_id = call.from_user.id
     data = call.data
     logger.info(f"Callback: User={user_id}, Data='{data}'")
@@ -7538,9 +7814,12 @@ def handle_callbacks(call):
         elif data == 'aisec_key': admin_required_callback(call, aisec_key_callback)
         elif data == 'aisec_model': admin_required_callback(call, aisec_model_callback)
         elif data == 'aisec_url': admin_required_callback(call, aisec_url_callback)
-        elif data == 'aisec_toggle': admin_required_callback(call, aisec_toggle_callback)
-        elif data == 'aisec_mode': admin_required_callback(call, aisec_mode_callback)
-        elif data == 'aisec_down': admin_required_callback(call, aisec_down_callback)
+        elif data in ('aisec_toggle', 'aisec_on', 'aisec_off'): admin_required_callback(call, aisec_toggle_callback)
+        elif data in ('aisec_mode', 'aisec_mode_normal', 'aisec_mode_strict'): admin_required_callback(call, aisec_mode_callback)
+        elif data in ('aisec_down', 'aisec_down_on', 'aisec_down_off'): admin_required_callback(call, aisec_down_callback)
+        elif data == 'aisec_providers': admin_required_callback(call, aisec_providers_callback)
+        elif data.startswith('aisec_set_'): admin_required_callback(call, aisec_setprov_callback)
+        elif data == 'aisec_models': admin_required_callback(call, aisec_models_callback)
         elif data == 'aisec_test': admin_required_callback(call, aisec_test_callback)
         elif data == 'aisec_log': admin_required_callback(call, aisec_log_callback)
         elif data == 'aisec_clearkey': admin_required_callback(call, aisec_clearkey_callback)
@@ -8781,53 +9060,94 @@ def _mask_key(key):
 def _ai_view():
     cfg = ai_config_get()
     ready, why = ai_ready(cfg)
-    host = urlsplit(cfg['base_url']).hostname or '-'
     if ready:
         now = 'AI + manual (dono chalenge)'
     else:
         reason = {'off': 'AI band hai', 'no_key': 'API key set nahi hai', 'no_model': 'model set nahi hai',
                   'paused': 'AI thodi der ke liye ruka hai (baar baar error aaya)'}.get(why, why)
         now = f'sirf manual scan ({reason})'
+    key_note = ''
+    if _ai_detect_provider(cfg['api_key']) == 'anthropic':
+        key_note = '\n⚠️ Ye Anthropic key lagti hai. Ye is bot me nahi chalegi (OpenAI-style server chahiye).'
     text = ('<b>🤖 AI Security</b>\n'
             'Manual scan hamesha chalta hai. AI uske upar ek dusri raay deta hai: kaun si file khatarnak hai aur kaun si nahi.\n\n'
             f"Status: <b>{'ON' if cfg['enabled'] else 'OFF'}</b>\n"
-            f"API key: <b>{_mask_key(cfg['api_key'])}</b>\n"
+            f"API key: <b>{_mask_key(cfg['api_key'])}</b>{key_note}\n"
+            f"Provider: <b>{html_escape(_ai_provider_label(cfg['base_url']))}</b>\n"
+            f"Server: <code>{html_escape(cfg['base_url'])}</code>\n"
             f"Model: <code>{html_escape(cfg['model'] or '-')}</code>\n"
-            f"Server: <code>{html_escape(host)}</code>\n"
             f"Mode: <b>{cfg['mode']}</b> ({'bahut khatarnak = seedha reject' if cfg['mode'] == 'strict' else 'AI sirf admin approval ke liye bhejta hai'})\n"
             f"Safe maan kar approval hatana: <b>{'ON' if cfg['allow_downgrade'] else 'OFF'}</b>\n\n"
             f'Abhi scan: {now}')
     kb = NavMenu(row_width=2)
-    kb.row(NavButton('⛔ AI band karo' if cfg['enabled'] else '✅ AI chalu karo', callback_data='aisec_toggle'),
+    kb.row(NavButton('⛔ AI band karo' if cfg['enabled'] else '✅ AI chalu karo',
+                     callback_data='aisec_off' if cfg['enabled'] else 'aisec_on'),
            NavButton('🔑 API Key set', callback_data='aisec_key'))
-    kb.row(NavButton('🧠 Model set', callback_data='aisec_model'), NavButton('🌐 API URL set', callback_data='aisec_url'))
-    kb.row(NavButton(f"🎚 Mode: {cfg['mode']}", callback_data='aisec_mode'),
-           NavButton(f"⬇️ Safe-approval: {'ON' if cfg['allow_downgrade'] else 'OFF'}", callback_data='aisec_down'))
+    kb.row(NavButton('🏢 Provider chuno', callback_data='aisec_providers'), NavButton('🧠 Model set', callback_data='aisec_model'))
+    kb.row(NavButton('🌐 API URL set', callback_data='aisec_url'), NavButton('📋 Models dekho', callback_data='aisec_models'))
+    kb.row(NavButton(f"🎚 Mode: {cfg['mode']}", callback_data='aisec_mode_normal' if cfg['mode'] == 'strict' else 'aisec_mode_strict'),
+           NavButton(f"⬇️ Safe-approval: {'ON' if cfg['allow_downgrade'] else 'OFF'}",
+                     callback_data='aisec_down_off' if cfg['allow_downgrade'] else 'aisec_down_on'))
     kb.row(NavButton('🧪 Test karo', callback_data='aisec_test'), NavButton('📜 Recent log', callback_data='aisec_log'))
     kb.row(NavButton('🗑 Key hatao', callback_data='aisec_clearkey'), NavButton('🧹 Cache saaf', callback_data='aisec_clearcache'))
     kb.row(NavButton('👑 Admin Panel', callback_data='admin_panel'))
     return text, kb
 
 
-def _ai_show(call_or_message, note=''):
+def _ai_show_chat(chat_id, note=''):
     text, kb = _ai_view()
     if note:
         text = note + '\n\n' + text
-    chat_id = call_or_message.chat.id if hasattr(call_or_message, 'chat') else call_or_message.message.chat.id
     _safe_send(chat_id, text, reply_markup=kb)
+
+
+def _ai_show(call_or_message, note=''):
+    chat_id = call_or_message.chat.id if hasattr(call_or_message, 'chat') else call_or_message.message.chat.id
+    _ai_show_chat(chat_id, note)
+
+
+def _ai_note_for(notes):
+    return ('✅ ' + ', '.join(notes) + '.') if notes else ''
 
 
 def ai_security_callback(call):
     bot.answer_callback_query(call.id)
+    notes = ai_autosetup(migrate=True)           # an old wrong mix (NVIDIA key + OpenAI server) is repaired here
     text, kb = _ai_view()
+    if notes:
+        text = _ai_note_for(notes) + '\n\n' + text
     _adm_show(call, text, kb)
 
 
-AI_TEST_TEXT = {'http_401': 'Key galat hai ya permission nahi.', 'http_403': 'Key galat hai ya permission nahi.',
-                'http_404': 'URL ya model ka naam galat lag raha hai.', 'http_429': 'Limit ya quota khatam ho gaya hai.',
-                'timeout': 'Server ne time par jawab nahi diya.', 'network': 'Server tak pahunch nahi paya. URL check karo.',
+AI_TEST_TEXT = {'http_400': 'Server ko request pasand nahi aayi (400). Model ka naam ya URL check karo.',
+                'http_401': 'Key galat hai ya is model ke liye permission nahi.',
+                'http_403': 'Key galat hai ya is model ke liye permission nahi.',
+                'http_404': 'Ye model is server par nahi mila.',
+                'http_429': 'Limit ya quota khatam ho gaya hai. Thodi der baad try karo.',
+                'timeout': 'Server ne time par jawab nahi diya.',
+                'network': 'Server tak pahunch nahi paya. URL ya internet check karo.',
+                'ssl': 'Server tak pahunch nahi paya (SSL/certificate problem). URL check karo.',
                 'bad_reply': 'Jawab samajh nahi aaya. Model ya URL check karo.', 'too_big': 'Jawab bahut bada tha.'}
 _AI_TEST_LAST = {}
+
+
+def _ai_bg(func, *args):
+    """Slow network work runs on its own thread, never on the thread that reads Telegram messages."""
+    threading.Thread(target=func, args=args, daemon=True).start()
+
+
+def _ai_status_text(status, cfg, detail=''):
+    """What went wrong, in plain words, for a status code of _ai_call / _ai_list_models."""
+    if status.startswith('http_5'):
+        text = 'Server me abhi dikkat hai (' + status[5:] + '). Thodi der baad try karo.'
+    else:
+        text = AI_TEST_TEXT.get(status, 'Jawab nahi mila.')
+    if status == 'http_404':
+        text += (f" Model: <code>{html_escape(cfg['model'])}</code>, server: <code>{html_escape(cfg['base_url'])}</code>."
+                 " Sahi naam ke liye 📋 Models dekho dabao.")
+    if detail:
+        text += f"\nServer ne kaha: <i>{html_escape(detail)}</i>"
+    return text
 
 
 def _ai_answer_prompt(call, prompt, handler):
@@ -8871,9 +9191,19 @@ def process_ai_key(message):
     if len(key) < 8 or len(key) > 400 or _AI_BAD_KEY_RX.search(key):
         _safe_send(message.chat.id, '⚠️ Key theek nahi lag rahi (space nahi hona chahiye). Dobara try karo.')
         return
+    if _ai_detect_provider(key) == 'anthropic':
+        _safe_send(message.chat.id, '⚠️ Ye Anthropic (Claude) key lagti hai. Ye is bot me nahi chalegi kyunki bot OpenAI-style '
+                                    'server maangta hai. NVIDIA, OpenAI, OpenRouter, Groq ya Gemini ki key use karo.')
+        return
     ai_config_update(api_key=key)
     logger.warning('AI key set by admin %s', message.from_user.id)
-    _ai_show(message, '✅ Key save ho gayi. Ab model set karo, phir AI chalu karo.')
+    notes = ai_autosetup()
+    cfg = ai_config_get()
+    info = f"Provider: {_ai_provider_label(cfg['base_url'])}."
+    if notes:
+        _ai_show(message, '✅ Key save ho gayi. ' + ', '.join(notes) + '. Ab 🧪 Test karo dabao.')
+    else:
+        _ai_show(message, '✅ Key save ho gayi. ' + info + ' Ab model set karo, phir 🧪 Test karo.')
 
 
 def aisec_model_callback(call):
@@ -8886,11 +9216,22 @@ def process_ai_model(message):
     name = message.text.strip()
     if name.lower() == '/cancel':
         return
-    if not re.fullmatch(r'[A-Za-z0-9._:/\-]{2,100}', name):
-        _safe_send(message.chat.id, '⚠️ Model ka naam theek nahi lag raha. Dobara try karo.')
+    cfg = ai_config_get()
+    server = _ai_provider_of_url(cfg['base_url'])
+    example = AI_PROVIDERS[server]['example'] if server else 'meta/llama-3.1-70b-instruct'
+    if _ai_model_is_provider_name(name):
+        _safe_send(message.chat.id, f'⚠️ "{html_escape(name[:40])}" provider ka naam hai, model ka naam nahi. '
+                                    f'Model ka poora naam bhejo, jaise <code>{html_escape(example)}</code>. '
+                                    'Naam yaad na ho to 📋 Models dekho dabao.')
+        return
+    if not _ai_model_ok(name):
+        _safe_send(message.chat.id, f'⚠️ Model ka naam theek nahi lag raha. Jaise <code>{html_escape(example)}</code>. Dobara try karo.')
         return
     ai_config_update(model=name)
-    _ai_show(message, '✅ Model save ho gaya.')
+    note = '✅ Model save ho gaya.'
+    if _ai_model_misfit(server, name):
+        note += f' Dhyan do: ye naam {_ai_provider_label(cfg["base_url"])} server par shayad na mile. 📋 Models dekho se check karo.'
+    _ai_show(message, note)
 
 
 def aisec_url_callback(call):
@@ -8913,26 +9254,31 @@ def process_ai_url(message):
 
 
 def aisec_toggle_callback(call):
+    """On / off. The key says which one ('aisec_on' / 'aisec_off'); the old 'aisec_toggle' flips."""
     cfg = ai_config_get()
-    if not cfg['enabled'] and not (cfg['api_key'] and cfg['model']):
+    want = {'aisec_on': True, 'aisec_off': False}.get(call.data, not cfg['enabled'])
+    if want and not (cfg['api_key'] and cfg['model']):
         bot.answer_callback_query(call.id, 'Pehle API key aur model set karo.', show_alert=True)
         return
-    ai_config_update(enabled=not cfg['enabled'])
-    logger.warning('AI scan %s by admin %s', 'enabled' if not cfg['enabled'] else 'disabled', call.from_user.id)
-    bot.answer_callback_query(call.id, 'AI chalu ho gaya.' if not cfg['enabled'] else 'AI band ho gaya, ab manual scan.')
+    if want != cfg['enabled']:
+        ai_config_update(enabled=want)
+        logger.warning('AI scan %s by admin %s', 'enabled' if want else 'disabled', call.from_user.id)
+    bot.answer_callback_query(call.id, 'AI chalu ho gaya.' if want else 'AI band ho gaya, ab manual scan.')
     _ai_show(call)
 
 
 def aisec_mode_callback(call):
     cfg = ai_config_get()
-    ai_config_update(mode='normal' if cfg['mode'] == 'strict' else 'strict')
+    mode = {'aisec_mode_strict': 'strict', 'aisec_mode_normal': 'normal'}.get(call.data)
+    ai_config_update(mode=mode or ('normal' if cfg['mode'] == 'strict' else 'strict'))
     bot.answer_callback_query(call.id, 'Mode badal gaya.')
     _ai_show(call)
 
 
 def aisec_down_callback(call):
     cfg = ai_config_get()
-    ai_config_update(allow_downgrade=not cfg['allow_downgrade'])
+    want = {'aisec_down_on': True, 'aisec_down_off': False}.get(call.data, not cfg['allow_downgrade'])
+    ai_config_update(allow_downgrade=want)
     bot.answer_callback_query(call.id, 'Setting badal gayi.')
     _ai_show(call)
 
@@ -8949,10 +9295,58 @@ def aisec_clearcache_callback(call):
     bot.answer_callback_query(call.id, f'{count} purane jawab hata diye.', show_alert=True)
 
 
+def aisec_providers_callback(call):
+    bot.answer_callback_query(call.id)
+    kb = NavMenu(row_width=2)
+    kb.row(NavButton('NVIDIA', callback_data='aisec_set_nvidia'), NavButton('OpenAI', callback_data='aisec_set_openai'))
+    kb.row(NavButton('OpenRouter', callback_data='aisec_set_openrouter'), NavButton('Groq', callback_data='aisec_set_groq'))
+    kb.row(NavButton('Gemini', callback_data='aisec_set_gemini'), NavButton('Custom', callback_data='aisec_set_custom'))
+    kb.row(NavButton('⬅️ Back', callback_data='adm_ai'))
+    _adm_show(call, '<b>🏢 Provider chuno</b>\nProvider dabate hi uska server aur ek achha model apne aap set ho jayega. '
+                    'Custom me apna URL khud doge.', kb)
+
+
+def aisec_setprov_callback(call):
+    pid = call.data[len('aisec_set_'):]
+    if pid == 'custom':
+        _ai_answer_prompt(call, '🌐 Apne server ka base URL bhejo (https se shuru, jaise https://api.example.com/v1). '
+                                'Phir Model set se model ka naam do. /cancel se ruko.', process_ai_url)
+        return
+    info = AI_PROVIDERS.get(pid)
+    if not info:
+        bot.answer_callback_query(call.id, 'Ye provider nahi mila.', show_alert=True)
+        return
+    ai_config_update(base_url=info['url'], model=info['model'])
+    logger.warning('AI provider set to %s by admin %s', info['name'], call.from_user.id)
+    bot.answer_callback_query(call.id, f"{info['name']} set ho gaya.")
+    _ai_show(call, f"✅ {info['name']} set ho gaya: server {html_escape(info['url'])}, model {html_escape(info['model'])}.")
+
+
+def _ai_test_worker(chat_id, cfg):
+    sample = [{'name': 'test.py', 'text': 'print("hello")\n', 'flagged': False, 'truncated': False, 'size': 15}]
+    info = {}
+    try:
+        reply, status = _ai_call(cfg, _ai_build_messages(sample, ['test.py'], []), info)
+        parsed = _ai_parse(reply, ['test.py']) if status == 'ok' else None
+        if parsed is not None:
+            note = '✅ AI sahi chal raha hai.'
+        else:
+            note = '⚠️ Test fail: ' + _ai_status_text(status if status != 'ok' else 'bad_reply', cfg, info.get('detail', ''))
+    except Exception:
+        logger.exception('AI test failed unexpectedly')
+        note = '⚠️ Test fail: ' + AI_TEST_TEXT['bad_reply']
+    _ai_show_chat(chat_id, note)
+
+
 def aisec_test_callback(call):
+    notes = ai_autosetup(migrate=True)
     cfg = ai_config_get()
     if not (cfg['api_key'] and cfg['model']):
         bot.answer_callback_query(call.id, 'Pehle API key aur model set karo.', show_alert=True)
+        return
+    if _ai_detect_provider(cfg['api_key']) == 'anthropic':
+        bot.answer_callback_query(call.id, 'Anthropic key is bot me nahi chalegi. NVIDIA, OpenAI, OpenRouter, Groq ya Gemini key do.',
+                                  show_alert=True)
         return
     now = time.time()
     if now - _AI_TEST_LAST.get(call.from_user.id, 0) < 10:
@@ -8960,14 +9354,44 @@ def aisec_test_callback(call):
         return
     _AI_TEST_LAST[call.from_user.id] = now
     bot.answer_callback_query(call.id, 'Test chal raha hai...')
-    sample = [{'name': 'test.py', 'text': 'print("hello")\n', 'flagged': False, 'truncated': False, 'size': 15}]
-    reply, status = _ai_call(cfg, _ai_build_messages(sample, ['test.py'], []))
-    parsed = _ai_parse(reply, ['test.py']) if status == 'ok' else None
-    if parsed is not None:
-        note = '✅ AI sahi chal raha hai.'
-    else:
-        note = '⚠️ Test fail: ' + AI_TEST_TEXT.get(status if status != 'ok' else 'bad_reply', 'Jawab nahi mila.')
-    _ai_show(call, note)
+    if notes:
+        _safe_send(call.message.chat.id, _ai_note_for(notes) + ' Ab test chal raha hai...')
+    _ai_bg(_ai_test_worker, call.message.chat.id, cfg)
+
+
+def _ai_models_worker(chat_id, cfg):
+    info = {}
+    try:
+        names, status = _ai_list_models(cfg, info)
+    except Exception:
+        logger.exception('AI model list failed unexpectedly')
+        names, status = None, 'bad_reply'
+    if names is None:
+        _safe_send(chat_id, '⚠️ Models ki list nahi mili: ' + _ai_status_text(status, cfg, info.get('detail', '')))
+        return
+    if not names:
+        _safe_send(chat_id, 'Server ne koi model nahi bataya.')
+        return
+    shown = names[:AI_MODELS_SHOWN]
+    more = f'\n...aur {len(names) - len(shown)} models.' if len(names) > len(shown) else ''
+    _safe_send(chat_id, f"<b>📋 Models ({html_escape(_ai_provider_label(cfg['base_url']))}, {len(names)})</b>\n<code>"
+                        + '\n'.join(html_escape(n) for n in shown) + '</code>' + more
+                        + '\n\nKoi naam copy karke 🧠 Model set me bhejo.')
+
+
+def aisec_models_callback(call):
+    notes = ai_autosetup(migrate=True)
+    cfg = ai_config_get()
+    if not cfg['api_key']:
+        bot.answer_callback_query(call.id, 'Pehle API key set karo.', show_alert=True)
+        return
+    now = time.time()
+    if now - _AI_TEST_LAST.get(('models', call.from_user.id), 0) < 5:
+        bot.answer_callback_query(call.id, 'Thoda ruko.', show_alert=True)
+        return
+    _AI_TEST_LAST[('models', call.from_user.id)] = now
+    bot.answer_callback_query(call.id, 'List la raha hoon...')
+    _ai_bg(_ai_models_worker, call.message.chat.id, cfg)
 
 
 def aisec_log_callback(call):
@@ -10426,6 +10850,27 @@ def run_polling_forever():
         SHUTDOWN_EVENT.wait(delay)
 
 
+_INSTANCE_LOCK = None
+
+
+def acquire_instance_lock(path=None):
+    """Only one copy of the bot may poll Telegram: two copies answer every key press twice. Returns True when this
+    process got the lock (it is held until the process ends); on a system without fcntl nothing is enforced."""
+    global _INSTANCE_LOCK
+    try:
+        import fcntl
+    except ImportError:
+        return True
+    handle = open(path or os.path.join(IROTECH_DIR, 'bot.lock'), 'a+')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    _INSTANCE_LOCK = handle
+    return True
+
+
 # --- Main Execution ---
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and bool(m.text) and not m.text.startswith('/'),
                      content_types=['text'])
@@ -10443,6 +10888,10 @@ if __name__ == '__main__':
             signal.signal(_sig, _handle_signal)
         except (ValueError, OSError) as exc:
             logger.warning("Could not install handler for %s: %s", _sig, exc)
+    if not acquire_instance_lock():
+        logger.error("Another copy of this bot is already running (same data folder). Stopping this one.")
+        logging.shutdown()
+        os._exit(1)                  # not sys.exit: the exit hook would stop scripts that belong to the running copy
     keep_alive()
     start_watchdog()
     logger.info("Starting polling...")
