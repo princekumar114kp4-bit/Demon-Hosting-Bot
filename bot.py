@@ -68,7 +68,7 @@ MAX_UNZIPPED_MB = _env_int('MAX_UNZIPPED_MB', 200)       # total size allowed af
 MAX_ZIP_FILES = _env_int('MAX_ZIP_FILES', 2000)          # max number of entries in one zip
 MAX_SCRIPT_LOG_MB = _env_int('MAX_SCRIPT_LOG_MB', 10)    # a script log above this is trimmed
 INSTALL_TIMEOUT = _env_int('INSTALL_TIMEOUT', 300)       # seconds allowed for pip / npm install
-LOG_LEVEL = os.environ.get('INFO').strip().upper() or 'INFO'
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').strip().upper()
 HEALTH_PORT = _env_int('PORT', 8080)
 
 # Folder setup
