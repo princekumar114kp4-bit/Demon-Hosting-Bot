@@ -162,6 +162,7 @@ REFERRAL_REWARD_DAYS = max(1, _env_int('REFERRAL_REWARD_DAYS', 7))
 PENDING_REFERRALS = {}                   # new user id -> referrer id, kept until the user passes the channel check
 BOT_USERNAME_CACHE = {'name': ''}
 HOST_START_TIME = time.time()
+BOT_VERSION = 'v10'                      # shown in the start-up log, /health and Bot Information: tells which code really runs
 SHUTDOWN_EVENT = threading.Event()
 HEALTH_STATE = {'last_poll_start': None, 'poll_restarts': 0, 'last_error': ''}
 user_subscriptions = {}
@@ -825,7 +826,7 @@ def health():
             running = sum(1 for info in bot_scripts.values()
                           if info.get('process') and info['process'].poll() is None)
             tracked = len(bot_scripts)
-        return jsonify(status='ok', uptime_seconds=int(time.time() - HOST_START_TIME),
+        return jsonify(status='ok', version=BOT_VERSION, uptime_seconds=int(time.time() - HOST_START_TIME),
                        scripts_running=running, scripts_tracked=tracked,
                        users=len(active_users), polling_restarts=HEALTH_STATE['poll_restarts'],
                        sandbox_mode=SANDBOX_MODE, isolation=('off' if SANDBOX_MODE == 'off' else _SANDBOX_STATE['level']))
@@ -5489,8 +5490,10 @@ def _files_view(user_id):
 
 # --- Full backup / restore ---------------------------------------------------
 # Two scopes, both packed into ONE zip:
-#   * Admin "Full Backup": the hosting bot's own source file + the whole hosting database +
-#     every user's folder from UPLOAD_BOTS_DIR (scripts and data). Owner / main admin only.
+#   * Admin "Full Backup": the whole hosting database + every user's folder from UPLOAD_BOTS_DIR (scripts, data,
+#     .env). Owner / main admin only. The hosting bot's OWN code is never exported and never restored: a restore
+#     can therefore never put an older version of the host in place of the running one. Old backups (made before
+#     v10) still hold a source/ copy of the bot code; on import that part is skipped and nothing of it is written.
 #   * User "My Bots" backup: only that user's own folder (scripts + data) and their script list.
 # Every restore is staged first, shown for a Yes/Cancel confirmation, and a backup of the current
 # state is written to disk (and sent to the person) before anything is overwritten.
@@ -5750,18 +5753,16 @@ def _db_counts(path):
 
 
 def _build_full_backup(zip_path, limit_mb=FULL_BACKUP_MAX_MB):
-    """Write the full backup zip (source + database + every user folder). limit_mb=None means no size limit
-    (used for the automatic safety backup). Returns a summary dict."""
+    """Write the full backup zip (database + every user folder; never the bot's own code). limit_mb=None means
+    no size limit (used for the automatic safety backup). Returns a summary dict."""
     work = tempfile.mkdtemp(prefix='demon_fullbk_')
     try:
         db_snap = os.path.join(work, 'bot_data.db')
         _snapshot_live_database(db_snap)
         counts = _db_counts(db_snap)
-        source_path = os.path.abspath(__file__)
         budget = {'bytes': 0, 'files': 0, 'max_bytes': limit_mb * 1024 * 1024 if limit_mb else None}
         users = {}
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-            archive.write(source_path, 'source/' + os.path.basename(source_path))
             archive.write(db_snap, 'database/bot_data.db')
             for uid_text, folder in _user_dirs():
                 added = _zip_add_folder(archive, folder, f'upload_bots/{uid_text}/', work, budget)
@@ -5769,13 +5770,12 @@ def _build_full_backup(zip_path, limit_mb=FULL_BACKUP_MAX_MB):
                     users[uid_text] = added
             manifest = {'format': BACKUP_FORMAT_FULL, 'version': BACKUP_VERSION,
                         'created': datetime.now().isoformat(timespec='seconds'),
-                        'source_name': os.path.basename(source_path),
+                        'bot_code_included': False,
                         'database_counts': {'users': counts[0], 'scripts': counts[1],
                                             'subscriptions': counts[2], 'admins': counts[3]},
                         'users': users}
             archive.writestr('manifest.json', json.dumps(manifest, indent=1))
-        return {'counts': counts, 'users': len(users), 'files': sum(users.values()),
-                'source_name': os.path.basename(source_path)}
+        return {'counts': counts, 'users': len(users), 'files': sum(users.values())}
     finally:
         _rmtree_quiet(work)
 
@@ -5830,9 +5830,10 @@ def _send_backup_file(chat_id, zip_path, base_name, caption):
 
 
 # --- Reading a backup zip (shared, zip-slip safe) -----------------------------
-def _extract_backup_zip(zip_path, payload_dir, rel_ok, max_bytes):
+def _extract_backup_zip(zip_path, payload_dir, rel_ok, max_bytes, skip_rel=None, skipped=None):
     """Check every entry, then extract into payload_dir. rel_ok(rel) says which entry names are allowed.
-    Returns (manifest_dict, error_text)."""
+    Entries for which skip_rel(rel) is true are checked like the rest but never written (their names are added
+    to the skipped list). Returns (manifest_dict, error_text)."""
     try:
         archive = zipfile.ZipFile(zip_path)
     except (zipfile.BadZipFile, OSError):
@@ -5860,6 +5861,10 @@ def _extract_backup_zip(zip_path, payload_dir, rel_ok, max_bytes):
                 seen.add(rel.lower())
             if 'manifest.json' not in seen:
                 return None, 'This is not a backup made by this bot (manifest missing).'
+            if skip_rel:
+                if skipped is not None:
+                    skipped.extend(i.filename for i in items if skip_rel(i.filename))
+                items = [i for i in items if not skip_rel(i.filename)]
             if sum(max(0, i.file_size) for i in items) > max_bytes:
                 return None, f'The backup is bigger than the {max_bytes // (1024 * 1024)} MB limit.'
             root = os.path.realpath(payload_dir)
@@ -5924,7 +5929,7 @@ def _inspect_hosting_db(path):
 def _full_rel_ok(rel):
     parts = rel.split('/')
     if parts[0] == 'source':
-        return len(parts) == 2 and parts[1].endswith('.py')
+        return len(parts) >= 2      # the bot code of an old backup: accepted as an entry, but skipped (see _backup_is_bot_code)
     if parts[0] == 'database':
         return rel == 'database/bot_data.db'
     if parts[0] == 'upload_bots':
@@ -5932,9 +5937,17 @@ def _full_rel_ok(rel):
     return False
 
 
+def _backup_is_bot_code(rel):
+    """Entries that hold the hosting bot's own code (old full backups have source/<bot>.py). Never restored."""
+    return rel.split('/')[0] == 'source'
+
+
 def _inspect_full_backup(zip_path, payload_dir):
-    """Validate + extract a full backup. Returns (ok, error_text, info)."""
-    manifest, err = _extract_backup_zip(zip_path, payload_dir, _full_rel_ok, FULL_BACKUP_MAX_MB * 1024 * 1024)
+    """Validate + extract a full backup. The bot code of an old backup is skipped, never extracted.
+    Returns (ok, error_text, info)."""
+    ignored_code = []
+    manifest, err = _extract_backup_zip(zip_path, payload_dir, _full_rel_ok, FULL_BACKUP_MAX_MB * 1024 * 1024,
+                                        skip_rel=_backup_is_bot_code, skipped=ignored_code)
     if err:
         return False, err, None
     if manifest.get('format') != BACKUP_FORMAT_FULL:
@@ -5946,23 +5959,6 @@ def _inspect_full_backup(zip_path, payload_dir):
     ok, problem, counts = _inspect_hosting_db(db_path)
     if not ok:
         return False, problem, None
-    source_path = source_name = None
-    source_dir = os.path.join(payload_dir, 'source')
-    if os.path.isdir(source_dir):
-        names = [n for n in os.listdir(source_dir) if n.endswith('.py')]
-        if len(names) != 1:
-            return False, 'The backup should hold exactly one bot code file.', None
-        source_name = names[0]
-        source_path = os.path.join(source_dir, source_name)
-        try:
-            if os.path.getsize(source_path) > 8 * 1024 * 1024:
-                return False, 'The bot code file inside the backup is too big.', None
-            with open(source_path, 'rb') as handle:
-                text = handle.read().decode('utf-8')
-            compile(text, source_name, 'exec')     # syntax check only; nothing is executed
-        except (UnicodeDecodeError, SyntaxError, ValueError, OSError):
-            return False, ('The bot code inside the backup does not compile, so I did not restore it. '
-                           'Nothing was changed.'), None
     users = {}
     upload_root = os.path.join(payload_dir, 'upload_bots')
     if os.path.isdir(upload_root):
@@ -5970,7 +5966,7 @@ def _inspect_full_backup(zip_path, payload_dir):
             count = sum(len(files) for _d, _n, files in os.walk(os.path.join(upload_root, uid_text)))
             users[uid_text] = count
     info = {'counts': counts, 'users': users, 'files': sum(users.values()),
-            'source_path': source_path, 'source_name': source_name,
+            'ignored_code': [os.path.basename(name) for name in ignored_code],
             'created': str(manifest.get('created', ''))[:19]}
     return True, '', info
 
@@ -6106,7 +6102,7 @@ def _replace_live_database(source_path):
 
 
 def full_backup_callback(call):
-    """Send ONE zip: bot source code + database + every user's uploaded bots and data."""
+    """Send ONE zip: database + every user's uploaded bots and data (not the hosting bot's own code)."""
     if not _can_backup_global(call.from_user.id):
         bot.answer_callback_query(call.id, '⚠️ Only the owner can export the full backup.', show_alert=True)
         return
@@ -6116,7 +6112,7 @@ def full_backup_callback(call):
     tmp_dir = tempfile.mkdtemp(prefix='demon_fullexport_')
     try:
         bot.answer_callback_query(call.id, 'Preparing the full backup...')
-        bot.send_message(call.message.chat.id, '⏳ Building the full backup (code + database + all users\' bots and data)...')
+        bot.send_message(call.message.chat.id, '⏳ Building the full backup (database + all users\' bots and data)...')
         base = f'demon_full_backup_{_now_stamp()}'
         zip_path = os.path.join(tmp_dir, base + '.zip')
         try:
@@ -6128,7 +6124,7 @@ def full_backup_callback(call):
             return
         counts = summary['counts']
         caption = ('<b>📦 Full Backup</b>\n'
-                   f'Bot code: <code>{html_escape(summary["source_name"])}</code>\n'
+                   'Bot code: not included (a restore never changes the running version)\n'
                    f'Database: {counts[0]} users, {counts[1]} scripts, {counts[2]} subscriptions, {counts[3]} admins\n'
                    f'Users\' bots and data: {summary["users"]} users, {summary["files"]} files\n'
                    f'Size: {_human_size(os.path.getsize(zip_path))}\n\n'
@@ -6171,7 +6167,7 @@ def full_restore_callback(call):
         'Send me the full backup <code>.zip</code> you exported earlier (as a file). If it came in parts '
         '(<code>.zip.001</code>, <code>.zip.002</code> ...), send every part, then tap <b>Done</b>.\n\n'
         '⚠️ This restores <b>everything</b>: the database, every user\'s bots and data (back into each user\'s '
-        'own folder), and the bot code file. I will show you a summary and ask you to confirm first. '
+        'own folder). The code of the hosting bot itself is never touched. I will show you a summary and ask you to confirm first. '
         'A backup of the current state is saved automatically before anything is overwritten.')
 
 
@@ -6354,9 +6350,9 @@ def _stage_backup(chat_id, uid, pend, zip_path):
         if pend['kind'] == 'full':
             counts = info['counts']
             now = _db_counts(DATABASE_PATH)
-            code_line = (f'• Bot code: <code>{html_escape(info["source_name"])}</code> (replaced on disk; the old '
-                         'file is kept next to it as a .bak copy and the new code is used after the next restart)'
-                         if info['source_path'] else '• Bot code: not in this backup, stays as it is')
+            code_line = ('• Bot code: this is an older backup that holds a copy of the bot code. That copy is skipped; '
+                         'the running bot code stays exactly as it is'
+                         if info['ignored_code'] else '• Bot code: not touched, the running version stays')
             text = ('<b>⚠️ Confirm full restore</b>'
                     + (f' (backup from {html_escape(info["created"])})' if info['created'] else '') + '\n\n'
                     f'<b>In the backup:</b> {counts[0]} users, {counts[1]} scripts, {counts[2]} subscriptions, '
@@ -6406,45 +6402,8 @@ def _handle_pending_import_upload(message):
 
 
 # --- Applying a restore -----------------------------------------------------------
-def _install_restored_source(source_path):
-    """Put the restored bot code on disk for the next start. The running process keeps its already loaded
-    code, so nothing breaks now. The old file is kept as a .bak copy. Returns (status, name)."""
-    if not source_path:
-        return 'none', ''
-    live = os.path.abspath(__file__)
-    with open(source_path, 'rb') as handle:
-        new_bytes = handle.read()
-    try:
-        with open(live, 'rb') as handle:
-            if handle.read() == new_bytes:
-                return 'same', os.path.basename(live)
-    except OSError:
-        pass
-    stamp = _now_stamp()
-    try:
-        if os.path.isfile(live):
-            shutil.copy2(live, f'{live}.bak_{stamp}')
-        tmp_path = f'{live}.new_{os.urandom(4).hex()}'
-        try:
-            with open(tmp_path, 'wb') as handle:
-                handle.write(new_bytes)
-            os.replace(tmp_path, live)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        _prune_backups(os.path.dirname(live), os.path.basename(live) + '.bak_')
-        return 'replaced', os.path.basename(live)
-    except OSError as exc:
-        logger.warning("Could not overwrite the bot code file (%s); saving it next to it instead", exc)
-        stem = os.path.splitext(os.path.basename(live))[0]
-        aside = os.path.join(os.path.dirname(live), f'{stem}_restored_{stamp}.py')
-        with open(aside, 'wb') as handle:
-            handle.write(new_bytes)
-        return 'saved_aside', os.path.basename(aside)
-
-
 def _apply_full_restore(entry):
-    """Safety backup -> database -> user folders -> bot code. Returns a result dict."""
+    """Safety backup -> database -> user folders. The bot code is never written. Returns a result dict."""
     info = entry['info']
     payload = entry['payload']
     os.makedirs(FULL_BACKUP_DIR, exist_ok=True)
@@ -6493,18 +6452,12 @@ def _apply_full_restore(entry):
         raise
     _rmtree_quiet(incoming)
     _rmtree_quiet(old_dir)
-    try:
-        source_status, source_name = _install_restored_source(info['source_path'])
-    except Exception:
-        logger.exception("Bot code could not be restored")
-        source_status, source_name = 'failed', ''
     missing = 0
     for owner_id, items in list(user_files.items()):
         for file_name, _ftype in list(items):
             if not os.path.isfile(os.path.join(UPLOAD_BOTS_DIR, str(owner_id), file_name)):
                 missing += 1
-    return {'pre_path': pre_path, 'stopped': stopped, 'source_status': source_status,
-            'source_name': source_name, 'missing': missing}
+    return {'pre_path': pre_path, 'stopped': stopped, 'missing': missing}
 
 
 def _apply_user_restore(entry):
@@ -6682,19 +6635,8 @@ def _confirm_full_restore(call, entry):
              f'• Database: {len(active_users)} users, {sum(len(v) for v in user_files.values())} scripts, '
              f'{len(user_subscriptions)} subscriptions, {len(admin_ids)} admins',
              f'• Bots and data: {len(info["users"])} user folder(s), {info["files"]} files, each back in its own user\'s folder']
-    status = result['source_status']
-    if status == 'replaced':
-        lines.append(f'• Bot code: <code>{html_escape(result["source_name"])}</code> replaced on disk '
-                     '(old copy kept as .bak). <b>Restart the bot to start using it.</b>')
-    elif status == 'same':
-        lines.append('• Bot code: identical to the running one, nothing to change.')
-    elif status == 'saved_aside':
-        lines.append(f'• Bot code: could not overwrite the running file, so it was saved as '
-                     f'<code>{html_escape(result["source_name"])}</code> next to it. Swap it in and restart when you are ready.')
-    elif status == 'failed':
-        lines.append('• Bot code: could not be restored (the data parts are fine).')
-    else:
-        lines.append('• Bot code: not in this backup.')
+    lines.append('• Bot code: not touched, the running version stays'
+                 + (' (the old copy inside this backup was skipped).' if info['ignored_code'] else '.'))
     if result['stopped']:
         lines.append(f'• {result["stopped"]} running bot(s) were stopped; start them again from My Files or Run All.')
     if result['missing']:
@@ -13185,6 +13127,7 @@ def system_info_callback(call):
         
         # Bot info
         info_parts.append("🤖 **Bot Information:**")
+        info_parts.append(f"• Bot version: {BOT_VERSION}")
         info_parts.append(f"• Python: {platform.python_version()}")
         info_parts.append(f"• Platform: {platform.platform()}")
         info_parts.append(f"• Bot Uptime: {time.strftime('%H:%M:%S', time.gmtime(max(0, time.time() - HOST_START_TIME)))}")
@@ -13826,8 +13769,8 @@ def handle_stale_text(message):
 
 
 if __name__ == '__main__':
-    logger.info("Starting up. Python %s | data dir: %s | owner: %s | admins: %s | banned: %s | channels: %s",
-                sys.version.split()[0], IROTECH_DIR, OWNER_ID, len(admin_ids), len(banned_users),
+    logger.info("Starting up. Bot version %s | Python %s | data dir: %s | owner: %s | admins: %s | banned: %s | channels: %s",
+                BOT_VERSION, sys.version.split()[0], IROTECH_DIR, OWNER_ID, len(admin_ids), len(banned_users),
                 len(mandatory_channels))
     for _sig in (signal.SIGINT, signal.SIGTERM):
         try:
