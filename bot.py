@@ -213,6 +213,7 @@ HOST_ONLY_ENV = frozenset({
     'FREE_USER_LIMIT', 'SUBSCRIBED_USER_LIMIT', 'MAX_UPLOAD_MB', 'MAX_UNZIPPED_MB', 'MAX_ZIP_FILES',
     'MAX_AUTO_RESTARTS', 'SCHEDULED_RESTART_HOURS', 'REFERRALS_PER_REWARD', 'REFERRAL_REWARD_DAYS',
     'DATABASE_URL', 'AI_PROVIDER', 'AI_MODEL', 'AI_BASE_URL',
+    'SANDBOX_MODE', 'SANDBOX_MEMORY_MB', 'SANDBOX_CPU_SECONDS', 'SANDBOX_FILE_MB', 'SANDBOX_MAX_PROCS', 'SANDBOX_UID_BASE',
 })
 
 
@@ -229,6 +230,583 @@ def child_env():
             env.pop(name, None)
     env.setdefault('PYTHONUNBUFFERED', '1')
     return env
+
+
+# --- Sandbox (isolation of hosted scripts) -------------------------------------------
+# SANDBOX_MODE (environment variable):
+#   auto   (default) use the strongest isolation this server really allows (tested at startup, level is logged and
+#          shown in the "script started" message); if nothing real is available, scripts still run with the basic
+#          protections (own folder, own HOME/TMPDIR, clean environment, resource limits) and the message says "basic".
+#   strict same tests, but NO script is started unless a real barrier works (level "full" or "partial");
+#          on a server that only gets "basic" nothing runs. Use it when you would rather stop than run unprotected.
+#   off    old behaviour (v8): no sandbox at all, scripts see everything the bot can see. Not recommended.
+# Levels: full = own private filesystem view (bubblewrap) or own OS user + kernel file lock together;
+#         partial = other users' files and the host folder / database are blocked by the kernel (file lock) or by
+#         file permissions (separate OS user), but not every limit is as strong;
+#         basic = folder + clean environment + limits only, NOT a real wall; off = nothing.
+SANDBOX_MODE = os.environ.get('SANDBOX_MODE', 'auto').strip().lower() or 'auto'
+if SANDBOX_MODE not in ('auto', 'strict', 'off'):
+    sys.stderr.write(f"Config warning: SANDBOX_MODE must be auto, strict or off; using auto (got {SANDBOX_MODE[:20]!r}).\n")
+    SANDBOX_MODE = 'auto'
+SANDBOX_MEMORY_MB = _env_int('SANDBOX_MEMORY_MB', 1024)          # memory (data segment) per script, 0 = no limit
+SANDBOX_CPU_SECONDS = _env_int('SANDBOX_CPU_SECONDS', 43200)     # CPU time per run (a restart resets it), 0 = no limit
+SANDBOX_FILE_MB = _env_int('SANDBOX_FILE_MB', 512)               # biggest single file a script may write, 0 = no limit
+SANDBOX_MAX_PROCS = _env_int('SANDBOX_MAX_PROCS', 256)           # processes per user; only used with a separate OS user
+SANDBOX_UID_BASE = _env_int('SANDBOX_UID_BASE', 200000)          # first OS user id handed out (only when running as root)
+SANDBOX_DATA_DIR = os.path.join(BASE_DIR, 'sandbox_data')        # per user: home, tmp, cache, pylibs (outside the uploaded files)
+_SANDBOX_LOCK = threading.Lock()
+_SANDBOX_DETECT_LOCK = threading.Lock()
+_SANDBOX_STATE = {'ready': False, 'level': 'basic', 'landlock': False, 'bwrap': None, 'uid': False,
+                  'launcher': True, 'detail': 'not checked yet'}
+
+# Tiny program that runs INSIDE the new process, just before the user's script starts: it opens the kernel file lock
+# (Landlock), drops to the separate OS user, sets the resource limits and no-new-privileges, blocks ptrace, closes every
+# inherited file descriptor and then replaces itself with the script (same PID). If something it was asked to do fails it
+# stops with an error instead of starting the script unprotected.
+_SANDBOX_LAUNCHER = r'''import ctypes, json, os, platform, resource, struct, sys
+
+def _fail(text):
+    sys.stderr.write("sandbox: " + text + "\n")
+    sys.stderr.flush()
+    os._exit(126)
+
+try:
+    cfg = json.loads(sys.argv[1])
+    cmd = sys.argv[2:]
+except Exception:
+    _fail("bad launcher arguments")
+if not cmd:
+    _fail("no command to run")
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+
+# Landlock access bits (kernel ABI 1 = bits 0-12, ABI 2 adds REFER, ABI 3 adds TRUNCATE)
+EXEC, WRITE_FILE, READ_FILE, READ_DIR = 1, 2, 4, 8
+FILE_RIGHTS = EXEC | WRITE_FILE | READ_FILE
+RO_RIGHTS = EXEC | READ_FILE | READ_DIR
+REFER, TRUNCATE = 1 << 13, 1 << 14
+
+class _RuleAttr(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
+
+def _landlock(ro_paths, rw_paths):
+    abi = libc.syscall(444, None, 0, 1)
+    if abi < 1:
+        _fail("kernel file lock (Landlock) is not available")
+    handled = (1 << 13) - 1
+    if abi >= 2:
+        handled |= REFER
+    if abi >= 3:
+        handled |= TRUNCATE
+    attr = ctypes.c_uint64(handled)
+    rs_fd = libc.syscall(444, ctypes.byref(attr), 8, 0)
+    if rs_fd < 0:
+        _fail("could not create the file lock")
+    full_rw = handled
+    for paths, rights in ((ro_paths, RO_RIGHTS), (rw_paths, full_rw)):
+        for path in paths:
+            try:
+                fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+            except OSError:
+                continue
+            try:
+                allowed = rights
+                if not os.path.isdir(path):
+                    allowed &= FILE_RIGHTS | TRUNCATE
+                rule = _RuleAttr(allowed & handled, fd)
+                if libc.syscall(445, rs_fd, 1, ctypes.byref(rule), 0) != 0:
+                    _fail("could not add a file lock rule")
+            finally:
+                os.close(fd)
+    return rs_fd, abi
+
+def _seccomp(deny_truncate):
+    arch = platform.machine()
+    if arch == "x86_64":
+        audit, nrs, x32 = 0xC000003E, [101, 310, 311], True
+        trunc = 76
+    elif arch in ("aarch64", "arm64"):
+        audit, nrs, x32 = 0xC00000B7, [117, 270, 271], False
+        trunc = 45
+    else:
+        return False
+    if deny_truncate:
+        nrs.append(trunc)
+    ins = [(0x20, 0, 0, 4), (0x15, 0, 0, audit), (0x20, 0, 0, 0)]
+    if x32:
+        ins.append((0x35, 0, 0, 0x40000000))
+    for nr in nrs:
+        ins.append((0x15, 0, 0, nr))
+    ins.append((0x06, 0, 0, 0x7FFF0000))          # allow
+    ins.append((0x06, 0, 0, 0x00050001))          # deny with EPERM
+    allow_at, deny_at = len(ins) - 2, len(ins) - 1
+    out = []
+    for i, (code, jt, jf, k) in enumerate(ins):
+        if i == 1:
+            jf = allow_at - i - 1
+        elif code in (0x15, 0x35) and i >= 3:
+            jt = deny_at - i - 1
+        out.append(struct.pack("HBBI", code, jt, jf, k))
+    blob = b"".join(out)
+    buf = ctypes.create_string_buffer(blob, len(blob))
+
+    class _Prog(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+    prog = _Prog(len(ins), ctypes.addressof(buf))
+    if libc.prctl(22, 2, ctypes.byref(prog), 0, 0) != 0:
+        return False
+    return True
+
+rs_fd, abi = (None, 0)
+if cfg.get("landlock"):
+    rs_fd, abi = _landlock(cfg.get("ro", []), cfg.get("rw", []))
+
+for name, value in (cfg.get("limits") or {}).items():
+    try:
+        which = getattr(resource, "RLIMIT_" + name)
+        hard = resource.getrlimit(which)[1]
+        value = int(value)
+        if hard != resource.RLIM_INFINITY and hard < value:
+            value = hard
+        resource.setrlimit(which, (value, value))
+    except (AttributeError, ValueError, OSError):
+        pass
+
+if cfg.get("uid") is not None:
+    try:
+        uid, gid = int(cfg["uid"]), int(cfg.get("gid", cfg["uid"]))
+        os.setgroups([])
+        os.setresgid(gid, gid, gid)
+        os.setresuid(uid, uid, uid)
+        if os.getuid() != uid or os.geteuid() != uid:
+            raise OSError("uid did not change")
+    except OSError:
+        _fail("could not switch to the separate user")
+
+if libc.prctl(38, 1, 0, 0, 0) != 0:                # no new privileges
+    _fail("could not set no-new-privileges")
+if rs_fd is not None and libc.syscall(446, rs_fd, 0) != 0:
+    _fail("could not start the file lock")
+if cfg.get("seccomp") and not _seccomp(abi < 3):
+    if cfg.get("seccomp_required"):
+        _fail("could not set the system call filter")
+try:
+    os.closerange(3, 1 << 20)                       # nothing from the host stays open
+except OSError:
+    pass
+try:
+    os.execvpe(cmd[0], cmd, os.environ)
+except FileNotFoundError:
+    sys.stderr.write("sandbox: command not found: %s\n" % cmd[0])
+    os._exit(127)
+except OSError as exc:
+    sys.stderr.write("sandbox: could not start: %s\n" % exc)
+    os._exit(126)'''
+
+
+class SandboxUnavailable(RuntimeError):
+    """SANDBOX_MODE=strict and no real isolation works on this server."""
+
+
+def sandbox_level_text():
+    """Plain-words isolation level for the 'script started' message."""
+    level = _SANDBOX_STATE['level'] if SANDBOX_MODE != 'off' else 'off'
+    return {'full': "full (own private space; other users' files and the host are not reachable)",
+            'partial': "partial (other users' files and the host are blocked, but not every protection is full)",
+            'basic': "basic (own folder, clean settings and limits only, NOT a real wall)",
+            'off': "off (no sandbox)"}.get(level, level)
+
+
+def _sandbox_id(user_folder):
+    name = os.path.basename(os.path.normpath(user_folder))
+    return name if name.isdigit() else re.sub(r'[^0-9A-Za-z_-]', '_', name) or 'user'
+
+
+def _path_is_under(path, root):
+    path, root = os.path.realpath(path), os.path.realpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _sandbox_banned_paths():
+    """Host folders no script may see: the data folder (database, backups, every user) and the folder of the bot code."""
+    return sorted({os.path.realpath(BASE_DIR), os.path.realpath(os.path.dirname(os.path.abspath(__file__)))})
+
+
+def _roots_without(root, banned):
+    """root minus the banned folders. The kernel file lock can only allow, never carve out, so when a banned folder is
+    inside root (for example the bot lives in /usr/src/app and /usr is needed) its siblings are listed instead."""
+    root = os.path.realpath(root)
+    if any(_path_is_under(root, b) for b in banned):
+        return []
+    if not any(_path_is_under(b, root) for b in banned):
+        return [root]
+    out = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    for name in names:
+        out.extend(_roots_without(os.path.join(root, name), banned))
+    return out
+
+
+def _sandbox_read_roots():
+    """Read-only (and runnable) places a script needs: the Python and Node runtimes, system libraries, a few /etc files."""
+    banned = _sandbox_banned_paths()
+    runtime = set()
+    for exe in (sys.executable, shutil.which('node'), shutil.which('npm')):
+        if not exe:
+            continue
+        real = os.path.realpath(exe)
+        folder = os.path.dirname(real)
+        runtime.add(os.path.dirname(folder) if os.path.basename(folder) == 'bin' else folder)
+    for prefix in {sys.prefix, sys.base_prefix, sys.exec_prefix}:
+        runtime.add(os.path.realpath(prefix))
+    # The runtime folders themselves are allowed even if they sit inside the bot folder (a virtualenv in /app);
+    # a runtime folder that IS or CONTAINS the bot folder is cut down like the system folders below.
+    roots = []
+    for item in sorted(runtime):
+        if any(_path_is_under(b, item) for b in banned):
+            roots.extend(_roots_without(item, banned))
+        else:
+            roots.append(item)
+    for item in ('/usr', '/lib', '/lib32', '/lib64', '/bin', '/sbin', '/nix'):
+        if os.path.exists(item):
+            roots.extend(_roots_without(item, banned))
+    for name in ('resolv.conf', 'hosts', 'nsswitch.conf', 'host.conf', 'gai.conf', 'passwd', 'group', 'localtime',
+                 'timezone', 'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d', 'ssl/certs', 'ssl/openssl.cnf', 'ca-certificates',
+                 'ca-certificates.conf', 'mime.types', 'protocols', 'services', 'alternatives', 'os-release',
+                 'debian_version', 'lsb-release', 'issue'):
+        roots.append(os.path.join('/etc', name))
+    for var in ('SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE', 'PIP_CERT'):
+        cert = os.environ.get(var)       # a public certificate file the host itself is set up to use (pip / npm need it)
+        if cert and os.path.isfile(cert) and not any(_path_is_under(b, cert) for b in banned):
+            roots.append(os.path.realpath(cert))
+    roots.extend(['/proc/self', '/proc/cpuinfo', '/proc/meminfo', '/proc/stat', '/proc/uptime', '/proc/loadavg',
+                  '/proc/version', '/proc/sys/vm/overcommit_memory', '/proc/sys/kernel/random/boot_id',
+                  '/sys/devices/system/cpu', '/sys/fs/cgroup'])
+    return sorted({r for r in roots if os.path.exists(r)})
+
+
+def _sandbox_dirs(user_folder):
+    base = os.path.join(SANDBOX_DATA_DIR, _sandbox_id(user_folder))
+    return {'base': base, 'home': os.path.join(base, 'home'), 'tmp': os.path.join(base, 'tmp'),
+            'cache': os.path.join(base, 'cache'), 'pylibs': os.path.join(base, 'pylibs')}
+
+
+def _chown_tree(path, uid, gid):
+    """Give a folder and everything in it to one OS user (only used when the bot runs as root)."""
+    try:
+        os.lchown(path, uid, gid)
+    except OSError:
+        pass
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                if os.lstat(full).st_uid != uid:
+                    os.lchown(full, uid, gid)
+            except OSError:
+                pass
+
+
+def _sandbox_uid_for(user_folder):
+    """Stable OS user id of one hosted user (kept by who owns the folder, nothing extra to store)."""
+    with _SANDBOX_LOCK:
+        try:
+            owner = os.stat(user_folder).st_uid
+        except OSError:
+            owner = None
+        if owner is not None and SANDBOX_UID_BASE <= owner < SANDBOX_UID_BASE + (1 << 24):
+            return owner
+        used = set()
+        try:
+            for name in os.listdir(UPLOAD_BOTS_DIR):
+                try:
+                    used.add(os.lstat(os.path.join(UPLOAD_BOTS_DIR, name)).st_uid)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        uid = SANDBOX_UID_BASE
+        while uid in used:
+            uid += 1
+        os.chmod(user_folder, 0o700)
+        _chown_tree(user_folder, uid, uid)
+        return uid
+
+
+def _sandbox_prepare(user_folder, with_uid):
+    """Make the user's private home / tmp / cache / package folders; with a separate OS user, also hand the folders over."""
+    dirs = _sandbox_dirs(user_folder)
+    for key in ('home', 'tmp', 'cache', 'pylibs'):
+        os.makedirs(dirs[key], mode=0o700, exist_ok=True)
+    uid = None
+    if with_uid:
+        uid = _sandbox_uid_for(user_folder)
+        _chown_tree(user_folder, uid, uid)          # files the host wrote (uploads, imports) belong to the user too
+        _chown_tree(dirs['base'], uid, uid)
+        os.chmod(user_folder, 0o700)
+        os.chmod(dirs['base'], 0o700)
+        for path, mode in ((UPLOAD_BOTS_DIR, 0o711), (SANDBOX_DATA_DIR, 0o711), (IROTECH_DIR, 0o700)):
+            try:
+                os.chmod(path, mode)                # other users can walk through but not list; the host database is shut
+            except OSError:
+                pass
+    return dirs, uid
+
+
+def _sandbox_limits(profile):
+    limits = {'CORE': 0, 'NOFILE': 4096}
+    if SANDBOX_MEMORY_MB > 0:
+        limits['DATA'] = SANDBOX_MEMORY_MB * 1024 * 1024 * (2 if profile == 'install' else 1)
+    if SANDBOX_CPU_SECONDS > 0:
+        limits['CPU'] = SANDBOX_CPU_SECONDS if profile == 'run' else max(INSTALL_TIMEOUT * 2, 60)
+    if SANDBOX_FILE_MB > 0:
+        limits['FSIZE'] = SANDBOX_FILE_MB * 1024 * 1024
+    return limits
+
+
+def _bwrap_prefix(bwrap, user_folder, dirs, work_dir=None):
+    """bubblewrap command line: a fresh filesystem with only the runtimes (read-only) and this user's own folders."""
+    argv = [bwrap, '--die-with-parent', '--new-session', '--unshare-pid', '--unshare-ipc', '--unshare-uts',
+            '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp']
+    for root in _sandbox_read_roots():
+        if root.startswith(('/proc', '/sys')):
+            continue
+        argv += ['--ro-bind-try', root, root]
+    for path in (user_folder, dirs['base'], work_dir):
+        if path:
+            argv += ['--bind', path, path]
+    return argv + ['--chdir', work_dir or user_folder]
+
+
+def _launcher_config(user_folder, dirs, uid, landlock, profile, work_dir=None):
+    read_only = _sandbox_read_roots()
+    limits = _sandbox_limits(profile)
+    if uid is not None and SANDBOX_MAX_PROCS > 0:
+        limits['NPROC'] = SANDBOX_MAX_PROCS          # per OS user, so one user's fork bomb cannot touch the others
+    return {'landlock': landlock, 'ro': read_only,
+            'rw': [os.path.realpath(user_folder), os.path.realpath(dirs['base'])]
+                  + ([os.path.realpath(work_dir)] if work_dir else [])
+                  + ['/dev/null', '/dev/zero', '/dev/urandom', '/dev/random', '/dev/tty'],
+            'limits': limits, 'uid': uid, 'seccomp': True, 'seccomp_required': False}
+
+
+def _sandbox_build(command, user_folder, profile='run', state=None, work_dir=None):
+    """(wrapped command, env additions). The same builder is used by the startup test and by every real start.
+    work_dir = one extra folder the command may also write (the temporary folder of an upload whose packages are installed)."""
+    state = state or _SANDBOX_STATE
+    dirs, uid = _sandbox_prepare(user_folder, state['uid'])
+    if work_dir and uid is not None:
+        _chown_tree(work_dir, uid, uid)
+        parent = os.path.dirname(os.path.realpath(work_dir))
+        tmp_root = os.path.realpath(tempfile.gettempdir())
+        while parent != tmp_root and _path_is_under(parent, tmp_root):     # let the user walk down to the work folder
+            try:
+                os.chmod(parent, (os.stat(parent).st_mode & 0o7777) | 0o711)
+            except OSError:
+                break
+            parent = os.path.dirname(parent)
+    cfg = _launcher_config(user_folder, dirs, uid, state['landlock'] and not state['bwrap'], profile, work_dir)
+    wrapped = [sys.executable, '-I', '-c', _SANDBOX_LAUNCHER, json.dumps(cfg)] + list(command)
+    if state['bwrap']:
+        wrapped = _bwrap_prefix(state['bwrap'], user_folder, dirs, work_dir) + ['--'] + wrapped
+    return wrapped, _sandbox_env(dirs, user_folder)
+
+
+def _sandbox_env(dirs, user_folder):
+    """Environment variables that point a script's HOME, temp files, caches and packages at its own folders."""
+    extra = {'HOME': dirs['home'], 'TMPDIR': dirs['tmp'], 'TMP': dirs['tmp'], 'TEMP': dirs['tmp'],
+             'XDG_CACHE_HOME': dirs['cache'], 'XDG_CONFIG_HOME': os.path.join(dirs['home'], '.config'),
+             'PIP_CACHE_DIR': os.path.join(dirs['cache'], 'pip'), 'npm_config_cache': os.path.join(dirs['cache'], 'npm'),
+             'npm_config_update_notifier': 'false', 'PWD': user_folder}
+    old_path = os.environ.get('PYTHONPATH', '')
+    extra['PYTHONPATH'] = dirs['pylibs'] + (os.pathsep + old_path if old_path else '')
+    return extra
+
+
+def sandbox_allows_start():
+    """False only in strict mode when no real barrier works here."""
+    if SANDBOX_MODE != 'strict':
+        return True
+    sandbox_detect()
+    return _SANDBOX_STATE['level'] in ('full', 'partial')
+
+
+def sandbox_wrap(command, user_folder, profile='run', work_dir=None):
+    """Command to really start for a hosted script: wrapped in the sandbox launcher unless SANDBOX_MODE=off.
+    Returns (command, env additions). profile 'install' is for pip / npm (more memory, CPU limited by INSTALL_TIMEOUT)."""
+    if SANDBOX_MODE == 'off' or not sys.platform.startswith('linux'):
+        return list(command), {}
+    sandbox_detect()
+    if not sandbox_allows_start():
+        raise SandboxUnavailable('No real isolation is available on this server (SANDBOX_MODE=strict), so nothing is started.')
+    if not _SANDBOX_STATE['launcher']:
+        dirs, _ = _sandbox_prepare(user_folder, False)
+        return list(command), _sandbox_env(dirs, user_folder)
+    return _sandbox_build(command, user_folder, profile, None, work_dir)
+
+
+def sandbox_pip_target(user_folder):
+    """Extra pip arguments so packages go to the user's own folder (never into the host's shared Python)."""
+    if SANDBOX_MODE == 'off' or not sys.platform.startswith('linux'):
+        return []
+    return ['--target', _sandbox_dirs(user_folder)['pylibs'], '--upgrade']
+
+
+_SELFTEST_PROBE = r'''
+import json, os, sys
+own, other, host_file, host_dir = sys.argv[1:5]
+out = {}
+try:
+    with open(os.path.join(own, "probe.txt"), "w") as handle:
+        handle.write("ok")
+    out["own_ok"] = open(os.path.join(own, "probe.txt")).read() == "ok" and os.path.exists(os.path.join(own, "own_secret.txt"))
+except OSError:
+    out["own_ok"] = False
+def blocked(fn):
+    try:
+        fn()
+    except OSError:
+        return True
+    return False
+out["other_blocked"] = blocked(lambda: open(other).read()) and blocked(lambda: os.listdir(os.path.dirname(other)))
+out["host_blocked"] = blocked(lambda: open(host_file).read()) and blocked(lambda: os.listdir(host_dir))
+print(json.dumps(out))
+'''
+
+
+def _sandbox_probe(state):
+    """Really start a probe script under `state` and check it: own folder works, another user's folder and the host
+    folder are blocked. Returns (ok, note). Nothing is trusted that was not seen working."""
+    root = os.path.join(SANDBOX_DATA_DIR, '_selftest')
+    mine = os.path.join(root, 'mine')
+    other_dir = os.path.join(root, 'other')
+    host_file = os.path.join(BASE_DIR, '.sandbox_selftest')
+    try:
+        for path in (mine, other_dir):
+            os.makedirs(path, exist_ok=True)
+        os.chmod(root, 0o711)
+        for path, text in ((os.path.join(mine, 'own_secret.txt'), 'mine'), (os.path.join(other_dir, 'secret.txt'), 'other'),
+                           (host_file, 'host')):
+            with open(path, 'w') as handle:
+                handle.write(text)
+        os.chmod(other_dir, 0o700)
+        os.chmod(host_file, 0o600)
+        user_folder = os.path.join(UPLOAD_BOTS_DIR, '0')      # not a real user: the probe's own folder
+        os.makedirs(user_folder, exist_ok=True)
+        os.makedirs(SANDBOX_DATA_DIR, exist_ok=True)
+        os.chmod(SANDBOX_DATA_DIR, 0o711)
+        with open(os.path.join(user_folder, 'own_secret.txt'), 'w') as handle:
+            handle.write('mine')
+        command = [sys.executable, '-I', '-c', _SELFTEST_PROBE, user_folder, os.path.join(other_dir, 'secret.txt'),
+                   host_file, UPLOAD_BOTS_DIR]
+        wrapped, extra = _sandbox_build(command, user_folder, 'install', state)
+        env = child_env()
+        env.update(extra)
+        proc = subprocess.run(wrapped, cwd=user_folder, env=env, capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL, start_new_session=True)
+        try:
+            result = json.loads((proc.stdout or '').strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return False, 'the test script did not run (' + (proc.stderr or '').strip()[-120:].replace('\n', ' ') + ')'
+        if result.get('own_ok') and result.get('other_blocked') and result.get('host_blocked'):
+            return True, 'ok'
+        return False, 'test result ' + json.dumps(result)
+    except Exception as exc:
+        return False, f'test could not run ({type(exc).__name__}: {exc})'
+    finally:
+        _rmtree_quiet(root)
+        for path in (host_file, os.path.join(UPLOAD_BOTS_DIR, '0'), os.path.join(SANDBOX_DATA_DIR, '0')):
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def _launcher_works(state):
+    """Basic level has no wall to test, but the launcher (limits, no-new-privileges) must at least start a script."""
+    try:
+        wrapped, extra = _sandbox_build([sys.executable, '-I', '-c', 'print(42)'], BASE_DIR, 'install', state)
+        env = child_env()
+        env.update(extra)
+        proc = subprocess.run(wrapped, cwd=BASE_DIR, env=env, capture_output=True, text=True, timeout=30,
+                              stdin=subprocess.DEVNULL, start_new_session=True)
+        return proc.returncode == 0 and proc.stdout.strip() == '42'
+    except Exception:
+        return False
+    finally:
+        shutil.rmtree(_sandbox_dirs(BASE_DIR)['base'], ignore_errors=True)
+
+
+def sandbox_detect(force=False):
+    """Find out ONCE what this server really allows (by trying it, not by guessing) and remember the level."""
+    with _SANDBOX_DETECT_LOCK:
+        if _SANDBOX_STATE['ready'] and not force:
+            return dict(_SANDBOX_STATE)
+        state = {'ready': True, 'level': 'basic', 'landlock': False, 'bwrap': None, 'uid': False,
+                 'launcher': True, 'detail': ''}
+        if SANDBOX_MODE == 'off' or not sys.platform.startswith('linux'):
+            state.update(level='off', launcher=False,
+                         detail='sandbox switched off' if SANDBOX_MODE == 'off' else 'not a Linux server')
+            with _SANDBOX_LOCK:
+                _SANDBOX_STATE.update(state)
+            return dict(state)
+        notes = []
+        bwrap = shutil.which('bwrap')
+        if bwrap:
+            ok, note = _sandbox_probe(dict(state, bwrap=bwrap))
+            if ok:
+                state['bwrap'] = bwrap
+                notes.append('private filesystem (bubblewrap) works')
+            else:
+                notes.append('bubblewrap is installed but does not work here: ' + note)
+        else:
+            notes.append('bubblewrap not installed')
+        ok, note = _sandbox_probe(dict(state, bwrap=None, landlock=True))
+        if ok:
+            state['landlock'] = True
+            notes.append('kernel file lock (Landlock) works')
+        else:
+            notes.append('kernel file lock (Landlock) does not work here: ' + note)
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            ok, note = _sandbox_probe(dict(state, landlock=state['landlock'], uid=True))
+            if ok:
+                state['uid'] = True
+                notes.append('separate OS user per bot works')
+            else:
+                notes.append('separate OS user per bot does not work: ' + note)
+        else:
+            notes.append('not running as root, so no separate OS user per bot')
+        if state['bwrap'] or (state['landlock'] and state['uid']):
+            state['level'] = 'full'
+        elif state['landlock'] or state['uid']:
+            state['level'] = 'partial'
+        else:
+            state['level'] = 'basic'
+            if not _launcher_works(state):
+                state['launcher'] = False
+                notes.append('limits helper does not run here, scripts start without limits')
+        state['detail'] = '; '.join(notes)
+        with _SANDBOX_LOCK:
+            _SANDBOX_STATE.update(state)
+        return dict(state)
+
+
+def sandbox_log_startup():
+    state = sandbox_detect()
+    logger.info("Sandbox: mode=%s, isolation level=%s. %s", SANDBOX_MODE, state['level'].upper(), state['detail'])
+    if SANDBOX_MODE == 'strict' and state['level'] not in ('full', 'partial'):
+        logger.error("Sandbox: SANDBOX_MODE=strict but no real isolation works here, so NO user script will be started.")
+    elif SANDBOX_MODE == 'auto' and state['level'] == 'basic':
+        logger.warning("Sandbox: only BASIC protection is possible on this server (not a real wall between users).")
+    elif SANDBOX_MODE == 'off':
+        logger.warning("Sandbox: switched OFF, hosted scripts can see everything this bot can see.")
 
 
 # --- Flask keep-alive + health endpoint ---
@@ -249,7 +827,8 @@ def health():
             tracked = len(bot_scripts)
         return jsonify(status='ok', uptime_seconds=int(time.time() - HOST_START_TIME),
                        scripts_running=running, scripts_tracked=tracked,
-                       users=len(active_users), polling_restarts=HEALTH_STATE['poll_restarts'])
+                       users=len(active_users), polling_restarts=HEALTH_STATE['poll_restarts'],
+                       sandbox_mode=SANDBOX_MODE, isolation=('off' if SANDBOX_MODE == 'off' else _SANDBOX_STATE['level']))
     except Exception:  # never let the health page crash
         logger.exception("Health endpoint error")
         return jsonify(status='error'), 500
@@ -327,7 +906,7 @@ NAV_STYLE_ENABLED = os.environ.get('BUTTON_STYLE', '1').strip().lower() not in (
 NAV_STYLES = ('primary', 'success', 'danger')
 # squares an older version put in front of labels; keyboards already on phones may still send them
 NAV_OLD_SQUARES = '🟦🟩🟧🟥🟪🟨⬛⬜🟫'
-NAV_NUMBERED_PREFIXES = ('file_', 'rv_', 'remove_channel_', 'um_u_', 'um_f_', 'um_r_')
+NAV_NUMBERED_PREFIXES = ('file_', 'rv_', 'hr_o_', 'remove_channel_', 'um_u_', 'um_f_', 'um_r_')
 
 NAV_STATE = {}
 NAV_LOCK = threading.RLock()
@@ -745,7 +1324,7 @@ def _nav_run(message, action):
 _NAV_VIEW_PREFIXES = (
     'check_files', 'file_', 'user_account', 'my_running', 'user_help', 'admin_dashboard', 'admin_panel',
     'user_management', 'admin_settings', 'hosting_health', 'subscription', 'stats', 'manual_install',
-    'adm_approvals', 'rv_v', 'rv_o', 'manage_mandatory_channels', 'all_users', 'list_admins', 'system_info',
+    'adm_approvals', 'adm_pending_reviews', 'rv_v', 'rv_o', 'hr_o', 'manage_mandatory_channels', 'all_users', 'list_admins', 'system_info',
     'bot_performance', 'database_backup', 'speed', 'adm_ai', 'adm_trusted', 'referral',
     'um_files', 'um_u_', 'um_f_', 'um_run', 'um_r_')
 
@@ -798,7 +1377,7 @@ def _nav_show_main(message, note=None):
 
 
 # Screens that open a paged list from the start: opening one of them again shows page 1.
-_PAGER_ENTRY_ACTIONS = ('back_to_main', 'check_files', 'my_running', 'adm_approvals', 'sec_center', 'sec_queue',
+_PAGER_ENTRY_ACTIONS = ('back_to_main', 'check_files', 'my_running', 'adm_approvals', 'adm_pending_reviews', 'sec_center', 'sec_queue',
                         'adm_trusted', 'all_users', 'remove_mandatory_channel', 'user_account', 'admin_dashboard',
                         'um_files', 'um_run')
 
@@ -835,7 +1414,10 @@ def _nav_refresh_chat(chat_id, user_id, note, force=False):
 
 def _nav_refresh_admins(note=None, exclude_chat=None):
     """The Approvals number changed: every admin whose screen shows it gets the fresh keyboard."""
-    note = note or f"🔄 Approvals ab {_pending_count()} hain."
+    if not note:
+        note = f"🔄 Approvals ab {_pending_count()} hain."
+        if _pending_high_count():
+            note += f" Pending Reviews {_pending_high_count()}."
     for admin_id in sorted(admin_ids):
         if admin_id == exclude_chat:
             continue
@@ -3120,7 +3702,8 @@ def _scan_mode_note(result):
 
 
 def _user_verdict_text(result, file_name, outcome):
-    """What the uploader sees: one or two short lines. outcome: 'auto' (LOW), 'review' (MEDIUM) or 'rejected' (HIGH)."""
+    """What the uploader sees: one or two short lines. outcome: 'auto' (LOW), 'review' (MEDIUM), 'held' (HIGH, waiting for
+    an admin) or 'rejected' (HIGH, could not be held)."""
     name = html_escape(file_name)
     mode = f"\n<i>{html_escape(_scan_mode_note(result))}</i>"
     if outcome == 'auto':
@@ -3128,6 +3711,9 @@ def _user_verdict_text(result, file_name, outcome):
     why = _reason_lines_html(result, 2)
     if outcome == 'review':
         return (f"{THREAT_BADGE[THREAT_MEDIUM]} <code>{name}</code> - admin approval chahiye, abhi start nahi hua.\n{why}{mode}")
+    if outcome == 'held':
+        return (f"{THREAT_BADGE[THREAT_HIGH]} <code>{name}</code> - scan mein khatarnak code mila, isliye start nahi hua. "
+                f"Admin review kar rahe hain, decision aane tak ye file wait karegi.\n{why}{mode}")
     return f"{THREAT_BADGE[THREAT_HIGH]} <code>{name}</code> - reject ho gaya (khatarnak code mila).\n{why}{mode}"
 
 
@@ -3208,7 +3794,12 @@ def _reviews_load():
 
 def _pending_count():
     with REVIEW_LOCK:
-        return sum(1 for item in PENDING_REVIEWS.values() if item['status'] == 'pending')
+        return sum(1 for item in PENDING_REVIEWS.values() if item['status'] == 'pending' and item['level'] != THREAT_HIGH)
+
+
+def _pending_high_count():
+    with REVIEW_LOCK:
+        return sum(1 for item in PENDING_REVIEWS.values() if item['status'] == 'pending' and item['level'] == THREAT_HIGH)
 
 
 def _user_pending_count(user_id):
@@ -3216,25 +3807,111 @@ def _user_pending_count(user_id):
         return sum(1 for item in PENDING_REVIEWS.values() if item['user_id'] == user_id)
 
 
-def _review_text(entry, expanded=False, outcome=None):
-    """Admin detail view of one waiting file (short)."""
+def _is_env_name(name):
+    base = os.path.basename(str(name or '')).lower()
+    return base.startswith('.env') or base.endswith('.env')
+
+
+def _review_zip_member(archive, flagged):
+    """The file inside a held zip to show: one the scanner flagged first, else the first script. Never an .env file."""
+    infos = [info for info in archive.infolist() if not info.is_dir() and not _is_env_name(info.filename)]
+    for wanted in flagged:
+        for info in infos:
+            if info.filename == wanted:
+                return info
+    for info in infos:
+        if info.filename.lower().endswith(('.py', '.js', '.sh', '.bash')):
+            return info
+    return infos[0] if infos else None
+
+
+def _review_preview_html(entry, budget):
+    """Read-only code preview of a held file for the admin, at most `budget` characters. The file is only read as text,
+    never run. .env files are never shown. Returns '' when there is nothing to show."""
+    if budget < 300:
+        return "ℹ️ Preview ke liye jagah nahi bachi, 'Get file' se padho."
+    name = entry['file_name']
+    shown_name, listing, problem = name, '', ''
+    try:
+        if entry['kind'] == 'upload':
+            path = _quarantine_path(entry['token'])
+        else:
+            path = os.path.join(get_user_folder(entry['user_id']), os.path.basename(name))
+        if not os.path.isfile(path):
+            return '⚠️ File ab available nahi hai, preview nahi dikha sakta.'
+        if entry['file_type'] == 'zip':
+            with zipfile.ZipFile(path) as archive:
+                flagged = [m for reason in entry.get('reasons', []) for m in re.findall(r'\[in ([^\]]+)\]', str(reason.get('text', '')))]
+                names = [info.filename for info in archive.infolist() if not info.is_dir()]
+                listing = (f"📦 Zip mein {len(names)} file(s): " + html_escape(', '.join(n[:40] for n in names[:6]))
+                           + (' ...' if len(names) > 6 else '') + '\n') if names else '📦 Zip khali hai.\n'
+                info = _review_zip_member(archive, flagged)
+                if info is None:
+                    return listing.strip()
+                shown_name = info.filename
+                with archive.open(info) as handle:
+                    raw = handle.read(UM_PREVIEW_READ_BYTES + 1)
+            big = len(raw) > UM_PREVIEW_READ_BYTES
+            raw = raw[:UM_PREVIEW_READ_BYTES]
+            text = None if b'\x00' in raw[:4096] else raw.decode('utf-8', errors='replace')
+            if text is None:
+                problem = 'Ye binary file lagti hai, text preview nahi hai.'
+        elif _is_env_name(name):
+            return 'ℹ️ Environment file ka preview nahi dikhate (secrets ho sakte hain).'
+        else:
+            text, big, problem = _um_read_text(path)
+    except Exception as exc:
+        logger.warning('Review preview failed for %s: %s', entry.get('token'), type(exc).__name__)
+        return "⚠️ Preview nahi ban paya, 'Get file' se padho."
+    head = f"👁 <b>Code preview</b> <code>{html_escape(shown_name[:60])}</code>\n{listing}"
+    if problem:
+        return head + f"ℹ️ {html_escape(problem)}"
+    all_lines = text.splitlines()
+    if not all_lines:
+        return head + '(file khali hai)'
+    body, shown, cut = _um_fit_html(all_lines[:FILE_PREVIEW_LINES], max(100, budget - len(head) - 120))
+    note = ''
+    if cut or big or len(all_lines) > FILE_PREVIEW_LINES:
+        note = f"\nℹ️ Pehli {shown} line(s) dikhayi, baaki 'Get file' se padho."
+    return head + f"<pre>{body}</pre>" + note
+
+
+def _review_text(entry, expanded=False, outcome=None, preview=False):
+    """Admin detail view of one waiting file. A HIGH file also says what Reject does and can show a code preview."""
     level = entry['level']
+    high = level == THREAT_HIGH
     created = datetime.fromtimestamp(entry['created']).strftime('%d %b %H:%M')
     reasons = (_reason_lines_html(entry, 6) or '• (no details stored)') + f"\n<i>{html_escape(_scan_mode_note(entry))}</i>"
-    lines = [f"{THREAT_BADGE[level]} <b>Approval chahiye</b>: <code>{html_escape(entry['file_name'])}</code>",
+    title = 'Admin decision chahiye (khatarnak code)' if high else 'Approval chahiye'
+    lines = [f"{THREAT_BADGE[level]} <b>{title}</b>: <code>{html_escape(entry['file_name'])}</code>",
              f"User: {html_escape(entry['uploader'] or 'user')} (<code>{entry['user_id']}</code>) - {created}",
              reasons]
     source = _review_source(entry)
     if source:
         lines.insert(2, source)
+    if high and entry['user_id'] not in admin_ids:
+        lines.append(f"<i>Reject par user ko strike lagega (abhi {scan_strikes.get(entry['user_id'], 0)}/{AUTO_SUSPEND_STRIKES}), "
+                     f"Approve par nahi lagega.</i>")
     if outcome:
         lines += ['', outcome]
-    return '\n'.join(lines)
+    text = '\n'.join(lines)
+    if high and preview:
+        shown = _review_preview_html(entry, min(FILE_PREVIEW_CHARS, 4096 - len(text) - 350))
+        if shown:
+            text += '\n\n' + shown
+    return text
 
 
 def _review_markup(entry, expanded=False, in_panel=True):
     token = entry['token']
     kb = NavMenu(row_width=2)
+    if entry['level'] == THREAT_HIGH:
+        # The token is in the key text: an older keyboard still on a phone can never press the key of another file.
+        kb.row(NavButton(f'✅ Approve #{token}', callback_data=f'hr_a_{token}'),
+               NavButton(f'❌ Reject #{token}', callback_data=f'hr_r_{token}'))
+        kb.row(NavButton(f'📄 Get file #{token}', callback_data=f'hr_f_{token}'),
+               NavButton('⬅️ Back to pending reviews', callback_data='adm_pending_reviews'))
+        return kb
     kb.row(NavButton('✅ Approve & run', callback_data=f'rv_a_{token}'),
            NavButton('❌ Reject', callback_data=f'rv_r_{token}'))
     kb.row(NavButton('📄 Get file to read', callback_data=f'rv_f_{token}'),
@@ -3254,7 +3931,8 @@ def _review_edit_all(entry, text, markup, skip_message_id=None):
 
 
 def _submit_for_review(user_id, uploader, chat_id, msg_id, file_name, file_type, data, result, kind='upload'):
-    """Hold a MEDIUM upload (or flag an existing hosted file) and ask every admin. Returns (token, error_text)."""
+    """Hold a MEDIUM or HIGH upload (or flag an existing hosted file) and ask every admin. Returns (token, error_text).
+    A HIGH upload is never run: the admins get the reasons, a code preview and Approve / Reject keys at once."""
     _expire_reviews()
     token = None
     with REVIEW_LOCK:
@@ -3287,6 +3965,12 @@ def _submit_for_review(user_id, uploader, chat_id, msg_id, file_name, file_type,
                 return None, 'Could not store the file for review. Please try again later.'
         PENDING_REVIEWS[token] = entry
     _review_db_save(entry)
+    if entry['level'] == THREAT_HIGH:
+        _notify_high_review(entry)
+        _review_db_save(entry)
+        logger.info('Review %s held (HIGH): user=%s file=%s kind=%s admins_notified=%s', token, user_id, file_name, kind,
+                    len(entry['admin_msgs']))
+        return token, ''
     # The notice carries the admin's keyboard built NOW, so "Approvals (n)" shows the new number at once (a reply keyboard
     # only changes when a message brings a new one). A chat that waits for a typed answer, or sits on a screen without
     # numbers, is left alone. They decide in Admin > Approvals.
@@ -3305,6 +3989,23 @@ def _submit_for_review(user_id, uploader, chat_id, msg_id, file_name, file_type,
     logger.info('Review %s queued: user=%s file=%s level=%s kind=%s admins_notified=%s', token, user_id, file_name,
                 result['level'], kind, len(entry['admin_msgs']))
     return token, ''
+
+
+def _notify_high_review(entry):
+    """Tell every admin about a held HIGH file: reasons, code preview and the Approve / Reject keys. An admin who is in
+    the middle of a typed answer gets the text without keys (the keys would replace his Cancel key), and decides from
+    Admin panel > Pending Reviews."""
+    text = _review_text(entry, preview=True)
+    for admin_id in sorted(admin_ids):
+        with NAV_LOCK:
+            st = _nav_get(admin_id)
+            busy = bool(st and st.get('await'))
+        if busy:
+            sent = _safe_send(admin_id, text + "\n\nAdmin panel > Pending Reviews mein decide karo.")
+        else:
+            sent = _safe_send(admin_id, text, reply_markup=_review_markup(entry))
+        if sent is not None:
+            entry['admin_msgs'][str(admin_id)] = sent.message_id
 
 
 def _expire_reviews():
@@ -3407,20 +4108,46 @@ def _drop_reviews(user_id, file_name=None, why='', kinds=None, notify_user=False
         if notify_user:
             _safe_send(entry['chat_id'], f"ℹ️ <code>{html_escape(entry['file_name'])}</code> ka review band ho gaya.")
     if dropped:
-        _nav_refresh_admins(f"🔄 Approvals ab {_pending_count()} hain.", exclude_chat=exclude_chat)
+        _nav_refresh_admins(exclude_chat=exclude_chat)
     return dropped
+
+
+def _show_review_list(call, high):
+    (_show_pending_reviews if high else _show_approvals)(call)
+
+
+def _review_file_gone(call, entry):
+    """A held HIGH file whose copy disappeared: nothing can be started, so the review is closed without a strike."""
+    _review_forget(entry)
+    logger.warning('Review %s closed: held file is gone (user=%s file=%s)', entry['token'], entry['user_id'], entry['file_name'])
+    _review_edit_all(entry, _review_text(entry, outcome='⚠️ File ab available nahi hai, review band ho gaya (strike nahi laga).'), None)
+    _safe_send(entry['chat_id'], f"ℹ️ <code>{html_escape(entry['file_name'])}</code> ka review band ho gaya, file mil nahi payi. "
+                                 "Zarurat ho to dobara upload karo.")
+    _safe_send(call.message.chat.id, f"⚠️ <code>{html_escape(entry['file_name'])}</code> ki held copy gayab thi, review hata diya.")
+    _show_review_list(call, True)
+    _nav_refresh_admins(exclude_chat=call.message.chat.id)
 
 
 def _review_approve(call, token):
     entry = _review_claim(token)
     if entry is None:
         bot.answer_callback_query(call.id, 'Ye request pehle hi handle ho chuki hai.', show_alert=True)
-        _show_approvals(call)
+        _show_review_list(call, (call.data or '').startswith('hr_'))
+        return
+    high = entry['level'] == THREAT_HIGH
+    user_id, file_name, file_type = entry['user_id'], entry['file_name'], entry['file_type']
+    if high and entry['kind'] == 'upload' and not os.path.isfile(_quarantine_path(token)):
+        bot.answer_callback_query(call.id, 'File ab available nahi hai.', show_alert=True)
+        _review_file_gone(call, entry)
+        return
+    if high and user_id in suspended_users and user_id not in admin_ids:
+        _review_release(token)
+        bot.answer_callback_query(call.id, 'Is user ki hosting suspend hai, isliye start nahi hogi. Pehle unsuspend karo ya Reject karo.',
+                                 show_alert=True)
         return
     bot.answer_callback_query(call.id, '✅ Approved. Start ho raha hai...')
     ok, err = False, 'Unknown problem.'
     try:
-        user_id, file_name, file_type = entry['user_id'], entry['file_name'], entry['file_type']
         reply_obj = _ReplyTarget(entry['chat_id'], entry['msg_id'], user_id)
         if is_user_banned(user_id):
             err = 'That user is banned.'
@@ -3450,14 +4177,15 @@ def _review_approve(call, token):
         ok, err = False, 'Something went wrong while starting the file.'
     if not ok:
         _review_release(token)
-        _safe_send(call.message.chat.id, f'⚠️ <code>{html_escape(entry["file_name"])}</code> start nahi ho paya: {html_escape(err)}\nAbhi bhi approvals mein hai.')
+        _safe_send(call.message.chat.id, f'⚠️ <code>{html_escape(entry["file_name"])}</code> start nahi ho paya: {html_escape(err)}\n'
+                                         f'Abhi bhi {"Pending Reviews" if high else "approvals"} mein hai.')
         return
     _review_forget(entry)
-    logger.info('Review %s approved by %s', token, call.from_user.id)
+    logger.info('Review %s approved by %s (level=%s)', token, call.from_user.id, entry['level'])
     admin_name = html_escape(call.from_user.first_name or 'Admin')
-    _review_edit_all(entry, _review_text(entry, outcome=f'✅ Approved by {admin_name}.'), None)
+    _review_edit_all(entry, _review_text(entry, outcome=f'✅ Approved by {admin_name}.' + (' Strike nahi laga.' if high else '')), None)
     _safe_send(entry['chat_id'], f"✅ Admin ne <code>{html_escape(entry['file_name'])}</code> approve kar diya, start ho raha hai.")
-    _show_approvals(call)
+    _show_review_list(call, high)
     _nav_refresh_admins(exclude_chat=call.message.chat.id)
 
 
@@ -3465,16 +4193,25 @@ def _review_reject(call, token):
     entry = _review_claim(token)
     if entry is None:
         bot.answer_callback_query(call.id, 'Ye request pehle hi handle ho chuki hai.', show_alert=True)
-        _show_approvals(call)
+        _show_review_list(call, (call.data or '').startswith('hr_'))
         return
+    high = entry['level'] == THREAT_HIGH
     bot.answer_callback_query(call.id, '❌ Rejected.')
     if entry['kind'] == 'existing':
         set_scan_decision(entry['user_id'], entry['file_name'], 'rejected')
     _review_forget(entry)
-    logger.info('Review %s rejected by %s', token, call.from_user.id)
-    _review_edit_all(entry, _review_text(entry, outcome=f"❌ Rejected by {html_escape(call.from_user.first_name or 'Admin')}."), None)
-    _safe_send(entry['chat_id'], f"❌ Admin ne <code>{html_escape(entry['file_name'])}</code> reject kar diya (security). Start nahi hua.")
-    _show_approvals(call)
+    logger.info('Review %s rejected by %s (level=%s)', token, call.from_user.id, entry['level'])
+    counted = high and entry['user_id'] not in admin_ids
+    strike_note = ''
+    if counted:
+        strike_note = f" Ye {scan_strikes.get(entry['user_id'], 0) + 1}/{AUTO_SUSPEND_STRIKES} security strike hai."
+    _review_edit_all(entry, _review_text(entry, outcome=f"❌ Rejected by {html_escape(call.from_user.first_name or 'Admin')}."
+                                                        + (' Strike lag gaya.' if counted else '')), None)
+    _safe_send(entry['chat_id'], f"❌ Admin ne <code>{html_escape(entry['file_name'])}</code> reject kar diya (security). "
+                                 f"File delete ho gayi, start nahi hua.{strike_note}")
+    if high:
+        record_malicious_upload(entry['user_id'], entry['file_name'], entry)
+    _show_review_list(call, high)
     _nav_refresh_admins(exclude_chat=call.message.chat.id)
 
 
@@ -3482,7 +4219,7 @@ def _approvals_view(chat_id=None):
     """Admin list of uploads waiting for a decision: (text, menu). One page (NAV_PAGE_SIZE items) at a time."""
     _expire_reviews()
     with REVIEW_LOCK:
-        items = sorted((dict(item) for item in PENDING_REVIEWS.values()), key=lambda item: item['created'])
+        items = sorted((dict(item) for item in PENDING_REVIEWS.values() if item['level'] != THREAT_HIGH), key=lambda item: item['created'])
     kb = NavMenu(row_width=1)
     if items:
         shown, page, pages = _paginate(chat_id, 'appr', items)
@@ -3515,10 +4252,48 @@ def approvals_callback(call):
     _show_approvals(call)
 
 
+def _pending_reviews_view(chat_id=None):
+    """Admin list of HIGH-threat uploads held for a decision: (text, menu). One page (NAV_PAGE_SIZE items) at a time."""
+    _expire_reviews()
+    with REVIEW_LOCK:
+        items = sorted((dict(item) for item in PENDING_REVIEWS.values()
+                        if item['level'] == THREAT_HIGH and item['status'] == 'pending'), key=lambda item: item['created'])
+    kb = NavMenu(row_width=1)
+    if items:
+        shown, page, pages = _paginate(chat_id, 'hrev', items)
+        kb.offset = page * NAV_PAGE_SIZE
+        text = (f'<b>🔴 Pending Reviews ({len(items)})</b>\nScanner ko khatarnak code mila, ye files abhi chali nahi hain. '
+                'Kisi ko kholo, code dekho, phir Approve ya Reject.' + _page_note(page, pages))
+        for item in shown:
+            who = (item['uploader'] or str(item['user_id']))[:14]
+            kb.add(NavButton(f"{THREAT_BADGE[item['level']]} {item['file_name'][:22]} - {who}", callback_data=f"hr_o_{item['token']}"))
+        kb.pager('hrev', 'adm_pending_reviews', page, pages)
+    else:
+        text = '<b>🔴 Pending Reviews (0)</b>\n✅ Kuch pending nahi hai.'
+    kb.add(NavButton('🔄 Refresh', callback_data='adm_pending_reviews'))
+    kb.add(NavButton('👑 Admin Panel', callback_data='admin_dashboard'))
+    kb.live = lambda cid=chat_id: _pending_reviews_view(cid)[1]
+    return text, kb
+
+
+def _show_pending_reviews(call):
+    chat_id = call.message.chat.id
+    text, kb = _pending_reviews_view(chat_id)
+    try:
+        bot.edit_message_text(text, chat_id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
+    except Exception:
+        _safe_send(chat_id, text, reply_markup=kb)
+
+
+def pending_reviews_callback(call):
+    bot.answer_callback_query(call.id)
+    _show_pending_reviews(call)
+
+
 def review_callback(call):
-    """Routes rv_a_ / rv_r_ / rv_f_ / rv_o_ buttons (admin only, checked by the caller)."""
+    """Routes rv_a_ / rv_r_ / rv_f_ / rv_o_ buttons and their hr_ twins for HIGH files (admin only, checked by the caller)."""
     parts = (call.data or '').split('_', 2)
-    if len(parts) != 3 or not _TOKEN_RE.fullmatch(parts[2]):
+    if len(parts) != 3 or parts[0] not in ('rv', 'hr') or not _TOKEN_RE.fullmatch(parts[2]):
         bot.answer_callback_query(call.id, 'Ye button ab valid nahi hai.', show_alert=True)
         return
     action, token = parts[1], parts[2]
@@ -3531,11 +4306,11 @@ def review_callback(call):
         entry = dict(entry) if entry else None
     if entry is None:
         bot.answer_callback_query(call.id, 'Ye request handle ho chuki hai ya expire ho gayi.', show_alert=True)
-        _show_approvals(call)
+        _show_review_list(call, parts[0] == 'hr')
         return
     if action in ('d', 's', 'o'):
         bot.answer_callback_query(call.id)
-        bot.edit_message_text(_review_text(entry), call.message.chat.id, call.message.message_id,
+        bot.edit_message_text(_review_text(entry, preview=True), call.message.chat.id, call.message.message_id,
                               parse_mode='HTML', reply_markup=_review_markup(entry))
         return
     if action == 'f':
@@ -3554,10 +4329,14 @@ def review_callback(call):
 # ---- launch gate ------------------------------------------------------------------------------
 def launch_gate(owner_id, file_name, file_type, actor_id, queue=True, admin_override=True):
     """Decide whether a hosted file may be started. Returns (allowed, note_html).
-    Admin-owned files run directly. For everyone else: LOW runs, MEDIUM needs an admin approval, HIGH never runs.
+    Admin-owned files run directly. For everyone else: LOW runs, MEDIUM needs an admin approval, HIGH runs only after
+    an admin approved that exact file (an unapproved HIGH file never runs).
     A stored verdict is only trusted while the file on disk still has the fingerprint that was scanned;
     otherwise (or when there is no record yet, e.g. old files) it is scanned again silently.
-    A suspended user's files never start, whoever asks."""
+    A suspended user's files never start, whoever asks. With SANDBOX_MODE=strict nothing starts on a server
+    where no real isolation works."""
+    if not sandbox_allows_start():
+        return False, "🔒 Is server par real sandbox isolation available nahi hai aur SANDBOX_MODE=strict set hai, isliye koi script start nahi hogi. Admin se baat karo."
     if owner_id in suspended_users and owner_id not in admin_ids:
         return False, "⏸️ Hosting is suspended for this account, so nothing can be started. Contact an admin if you think this is a mistake."
     if owner_id in admin_ids or owner_id in trusted_users:
@@ -3577,7 +4356,7 @@ def launch_gate(owner_id, file_name, file_type, actor_id, queue=True, admin_over
     why = _reason_lines_html(rec, 2)
     if decision == 'rejected':
         return False, f"{THREAT_BADGE[THREAT_HIGH]} Admin ne ye file pehle reject ki thi, start nahi hogi."
-    if level == THREAT_HIGH:
+    if level == THREAT_HIGH and decision != 'approved':
         return False, f"{THREAT_BADGE[THREAT_HIGH]} Khatarnak code mila, start nahi hoga.\n{why}"
     if level == THREAT_LOW or decision in ('approved', 'admin'):
         return True, ''
@@ -4014,7 +4793,8 @@ def get_user_folder(user_id):
 def get_sandbox_name(user_id):
     """Stable, visible name of one user's sandbox: always the same for the same user (nothing random, nothing stored).
     A sandbox here = that user's own folder (get_user_folder) + their scripts running as separate processes that start
-    inside that folder with a cleaned environment. It is NOT a container or kernel-level sandbox."""
+    inside that folder with a cleaned environment, their own HOME / TMPDIR / package folder and resource limits.
+    How strong the wall around it is depends on the server: see the Sandbox section (sandbox_level_text, SANDBOX_MODE)."""
     return f"sandbox_{int(user_id)}"
 
 
@@ -4262,8 +5042,9 @@ def _is_safe_package_name(name):
     return bool(name) and bool(_SAFE_PACKAGE_RE.match(name))
 
 
-def attempt_install_pip(module_name, message, manual_request=False):
-    """Install Python package via pip"""
+def attempt_install_pip(module_name, message, manual_request=False, user_folder=None):
+    """Install Python package via pip. With user_folder the package goes into that user's own sandbox package folder
+    (the install itself runs inside the sandbox), so one user can never change what another user's scripts import."""
     package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name) 
     if package_name is None: 
         logger.info(f"Module '{module_name}' is core. Skipping pip install.")
@@ -4279,9 +5060,15 @@ def attempt_install_pip(module_name, message, manual_request=False):
             bot.reply_to(message, "❌ That package name is not valid. Send just the package name, for example `requests`.", parse_mode='Markdown')
             return False, "Invalid package name"
         command = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', package_name]
-        logger.info(f"Running install: {' '.join(command)}")
-        result = subprocess.run(command, capture_output=True, text=True, check=False, encoding='utf-8', errors='ignore',
-                                timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=child_env())
+        run_env, run_cwd = child_env(), None
+        if user_folder:
+            command[4:4] = sandbox_pip_target(user_folder)
+            command, extra_env = sandbox_wrap(command, user_folder, 'install')
+            run_env.update(extra_env)
+            run_cwd = user_folder
+        logger.info(f"Running install: pip install {package_name}")
+        result = subprocess.run(command, capture_output=True, text=True, check=False, encoding='utf-8', errors='ignore', cwd=run_cwd,
+                                timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=run_env, start_new_session=True)
         
         if result.returncode == 0:
             log_msg = f"Installed {package_name}. Output:\n{result.stdout}"
@@ -4323,8 +5110,11 @@ def attempt_install_npm(module_name, user_folder, message, manual_request=False)
             return False, "Invalid package name"
         command = ['npm', 'install', module_name]
         logger.info(f"Running npm install: {' '.join(command)} in {user_folder}")
+        run_env = child_env()
+        command, extra_env = sandbox_wrap(command, user_folder, 'install')
+        run_env.update(extra_env)
         result = subprocess.run(command, capture_output=True, text=True, check=False, cwd=user_folder, encoding='utf-8', errors='ignore',
-                                timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=child_env())
+                                timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=run_env, start_new_session=True)
         
         if result.returncode == 0:
             log_msg = f"Installed {module_name}. Output:\n{result.stdout}"
@@ -4405,7 +5195,7 @@ def process_manual_install_module(message):
         success, log = attempt_install_npm(module_name, user_folder, message, manual_request=True)
     else:
         # Python module
-        success, log = attempt_install_pip(module_name, message, manual_request=True)
+        success, log = attempt_install_pip(module_name, message, manual_request=True, user_folder=get_user_folder(user_id))
     
     if success:
         logger.info(f"User {user_id} manually installed module: {module_name}")
@@ -4658,6 +5448,7 @@ def create_main_menu_inline(user_id):
     if user_id in admin_ids:
         markup.row(NavButton('👑 Admin Center', callback_data='admin_dashboard'),
                    NavButton(f'📥 Approvals ({_pending_count()})', callback_data='adm_approvals'))
+        markup.row(NavButton(f'🔴 Pending Reviews ({_pending_high_count()})', callback_data='adm_pending_reviews'))
         markup.row(NavButton('🩺 Hosting Health', callback_data='hosting_health'),
                    NavButton('⚙️ Admin Settings', callback_data='admin_settings'))
         markup.row(NavButton('👥 User Management', callback_data='user_management'),
@@ -5267,7 +6058,7 @@ def _stop_scripts(owner_id=None):
     """Stop running scripts (all, or one user's) without letting the watchdog bring them back."""
     with STATE_LOCK:
         items = [(key, info) for key, info in bot_scripts.items()
-                 if owner_id is None or key.startswith(f'{owner_id}_')]
+                 if owner_id is None or str(info.get('script_owner_id', '')) == str(owner_id)]
     for key, info in items:
         RESTART_STATE.setdefault(key, {"attempts": 0, "manual_stop": False})["manual_stop"] = True
         try:
@@ -5980,6 +6771,7 @@ def create_admin_panel():
     )
     markup.row(NavButton('📋 List Admins', callback_data='list_admins'),
                NavButton(f'📥 Approvals ({_pending_count()})', callback_data='adm_approvals'))
+    markup.row(NavButton(f'🔴 Pending Reviews ({_pending_high_count()})', callback_data='adm_pending_reviews'))
     markup.row(NavButton('🗄 Database Backup', callback_data='database_backup'),
                NavButton('📤 Export Users', callback_data='export_users'))
     markup.row(NavButton('📦 Export Full Backup', callback_data='export_database'),
@@ -6923,17 +7715,16 @@ def _gh_finish(ctx, main):
         text = _user_verdict_text(result, label, outcome)
         if outcome == 'rejected':
             text += '\nKuch save ya start nahi hua.'
-        elif outcome == 'review' and ctx.get('update'):
+        elif outcome in ('review', 'held') and ctx.get('update'):
             text += '\nPurana version waise hi chalta rahega.'
         _gh_say(ctx, f"{head}\n{text}")
 
     if not is_admin and not is_trusted and level == THREAT_HIGH:
-        verdict('rejected')
-        notice = (f"🔴 GitHub deploy reject hua: <code>{html_escape(info['url'])}</code> from {html_escape(ctx['uploader'])} "
-                  f"(<code>{user_id}</code>)\n{_reason_lines_html(result, 5)}\n<i>{html_escape(_scan_mode_note(result))}</i>")
-        for admin_id in sorted(admin_ids):
-            _safe_send(admin_id, notice)
-        record_malicious_upload(user_id, zip_name, result)
+        token, err = _submit_for_review(user_id, ctx['uploader'], chat_id, ctx['status_id'], zip_name, 'zip', data, result)
+        if token:
+            verdict('held')
+        else:
+            _gh_say(ctx, f"{head}\n{THREAT_BADGE[level]} Start nahi hua. {html_escape(err)}")
         return
     if not is_admin and not is_trusted and level == THREAT_MEDIUM:
         token, err = _submit_for_review(user_id, ctx['uploader'], chat_id, ctx['status_id'], zip_name, 'zip', data, result)
@@ -7238,9 +8029,13 @@ def _install_zip_deps(folder, message, user_id, safe=False, do_pip=True, do_npm=
         logger.info(f"requirements.txt found, installing: {req_path}")
         bot.reply_to(message, f"🔄 Installing Python deps from `{req_file}`...")
         try:
-            command = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '-r', req_path]
-            result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore',
-                                    timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=child_env())
+            command = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input',
+                       *sandbox_pip_target(get_user_folder(user_id)), '-r', req_path]
+            command, extra_env = sandbox_wrap(command, get_user_folder(user_id), 'install', work_dir=folder)
+            run_env = child_env()
+            run_env.update(extra_env)
+            result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore', cwd=folder,
+                                    timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=run_env, start_new_session=True)
             logger.info(f"pip install from requirements.txt OK. Output:\n{result.stdout}")
             bot.reply_to(message, f"✅ Python deps from `{req_file}` installed.")
         except subprocess.CalledProcessError as e:
@@ -7261,8 +8056,11 @@ def _install_zip_deps(folder, message, user_id, safe=False, do_pip=True, do_npm=
         bot.reply_to(message, f"🔄 Installing Node deps from `{pkg_json}`...")
         try:
             command = ['npm', 'install', '--ignore-scripts'] if safe else ['npm', 'install']
+            command, extra_env = sandbox_wrap(command, get_user_folder(user_id), 'install', work_dir=folder)
+            run_env = child_env()
+            run_env.update(extra_env)
             result = subprocess.run(command, capture_output=True, text=True, check=True, cwd=folder, encoding='utf-8', errors='ignore',
-                                    timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=child_env())
+                                    timeout=INSTALL_TIMEOUT, stdin=subprocess.DEVNULL, env=run_env, start_new_session=True)
             logger.info(f"npm install OK. Output:\n{result.stdout}")
             bot.reply_to(message, f"✅ Node deps from `{pkg_json}` installed.")
         except FileNotFoundError:
@@ -7645,6 +8443,20 @@ def _popen_kwargs(user_folder=None, file_name=None):
     return kwargs
 
 
+def _sandboxed(command, user_folder, file_name):
+    """(command to start, extra Popen arguments) for one hosted script, wrapped in the sandbox (SANDBOX_MODE)."""
+    kwargs = _popen_kwargs(user_folder, file_name)
+    wrapped, extra = sandbox_wrap(command, user_folder)
+    own_env = load_bot_env(user_folder, file_name) if file_name else {}
+    for key, value in extra.items():
+        if key == 'PYTHONPATH' and own_env.get('PYTHONPATH'):
+            value = value.split(os.pathsep)[0] + os.pathsep + own_env['PYTHONPATH']
+        elif key in own_env:
+            continue                         # the user's own variable of the same name wins (not for the sandbox folders)
+        kwargs['env'][key] = value
+    return wrapped, kwargs
+
+
 def _kill_check_process(check_proc):
     """Stop a pre-check process (and anything it started) and reap it."""
     if check_proc is None:
@@ -7741,7 +8553,8 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
             logger.info(f"Running Python pre-check: {' '.join(check_command)}")
             check_proc = None
             try:
-                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='ignore', **_popen_kwargs(user_folder, file_name))
+                check_command, popen_kw = _sandboxed(check_command, user_folder, file_name)
+                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='ignore', **popen_kw)
                 stdout, stderr = check_proc.communicate(timeout=5)
                 return_code = check_proc.returncode
                 logger.info(f"Python Pre-check early. RC: {return_code}. Stderr: {stderr[:200]}...")
@@ -7750,7 +8563,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
                     if match_py:
                         module_name = match_py.group(1).strip().strip("'\"")
                         logger.info(f"Detected missing Python module: {module_name}")
-                        success, _ = attempt_install_pip(module_name, message_obj_for_reply)
+                        success, _ = attempt_install_pip(module_name, message_obj_for_reply, user_folder=user_folder)
                         if success:
                             logger.info(f"Install OK for {module_name}. Retrying run_script...")
                             bot.reply_to(message_obj_for_reply, f"🔄 Install successful. Retrying '{file_name}'...")
@@ -7790,9 +8603,10 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
              bot.reply_to(message_obj_for_reply, f"❌ Failed to open the log file for '{file_name}' in {get_sandbox_name(script_owner_id)}: {_scrub_host_paths(e, user_folder)}")
              return
         try:
+            run_command, popen_kw = _sandboxed([sys.executable, '-u', script_path], user_folder, file_name)
             process = subprocess.Popen(
-                [sys.executable, '-u', script_path], cwd=user_folder, stdout=log_file, stderr=log_file,
-                stdin=subprocess.PIPE, encoding='utf-8', errors='ignore', **_popen_kwargs(user_folder, file_name)
+                run_command, cwd=user_folder, stdout=log_file, stderr=log_file,
+                stdin=subprocess.PIPE, encoding='utf-8', errors='ignore', **popen_kw
             )
             logger.info(f"Started Python process {process.pid} for {script_key}")
             _register_script(script_key, {
@@ -7801,7 +8615,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
                 'script_owner_id': script_owner_id, # Actual owner of the script
                 'start_time': datetime.now(), 'user_folder': user_folder, 'type': 'py', 'script_key': script_key, 'reply_target': message_obj_for_reply
             })
-            bot.reply_to(message_obj_for_reply, f"✅ Python script '{file_name}' started! (PID: {process.pid}) (For User: {script_owner_id})\n🧱 Sandbox: {get_sandbox_name(script_owner_id)}")
+            bot.reply_to(message_obj_for_reply, f"✅ Python script '{file_name}' started! (PID: {process.pid}) (For User: {script_owner_id})\n🧱 Sandbox: {get_sandbox_name(script_owner_id)}\n🔒 Isolation: {sandbox_level_text()}")
         except FileNotFoundError:
              logger.error(f"Python interpreter {sys.executable} not found for long run {script_key}")
              bot.reply_to(message_obj_for_reply, f"❌ Error: Python interpreter '{sys.executable}' not found.")
@@ -7858,7 +8672,8 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
             logger.info(f"Running JS pre-check: {' '.join(check_command)}")
             check_proc = None
             try:
-                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='ignore', **_popen_kwargs(user_folder, file_name))
+                check_command, popen_kw = _sandboxed(check_command, user_folder, file_name)
+                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='ignore', **popen_kw)
                 stdout, stderr = check_proc.communicate(timeout=5)
                 return_code = check_proc.returncode
                 logger.info(f"JS Pre-check early. RC: {return_code}. Stderr: {stderr[:200]}...")
@@ -7909,9 +8724,10 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
             bot.reply_to(message_obj_for_reply, f"❌ Failed to open the log file for '{file_name}' in {get_sandbox_name(script_owner_id)}: {_scrub_host_paths(e, user_folder)}")
             return
         try:
+            run_command, popen_kw = _sandboxed(['node', script_path], user_folder, file_name)
             process = subprocess.Popen(
-                ['node', script_path], cwd=user_folder, stdout=log_file, stderr=log_file,
-                stdin=subprocess.PIPE, encoding='utf-8', errors='ignore', **_popen_kwargs(user_folder, file_name)
+                run_command, cwd=user_folder, stdout=log_file, stderr=log_file,
+                stdin=subprocess.PIPE, encoding='utf-8', errors='ignore', **popen_kw
             )
             logger.info(f"Started JS process {process.pid} for {script_key}")
             _register_script(script_key, {
@@ -7920,7 +8736,7 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
                 'script_owner_id': script_owner_id, # Actual owner of the script
                 'start_time': datetime.now(), 'user_folder': user_folder, 'type': 'js', 'script_key': script_key, 'reply_target': message_obj_for_reply
             })
-            bot.reply_to(message_obj_for_reply, f"✅ JS script '{file_name}' started! (PID: {process.pid}) (For User: {script_owner_id})\n🧱 Sandbox: {get_sandbox_name(script_owner_id)}")
+            bot.reply_to(message_obj_for_reply, f"✅ JS script '{file_name}' started! (PID: {process.pid}) (For User: {script_owner_id})\n🧱 Sandbox: {get_sandbox_name(script_owner_id)}\n🔒 Isolation: {sandbox_level_text()}")
         except FileNotFoundError:
              error_msg = "❌ Error: 'node' not found for long run. Ensure Node.js is installed."
              logger.error(error_msg)
@@ -8374,7 +9190,7 @@ def process_admin_install(message):
             success, log = attempt_install_npm(module_name, user_folder, message, manual_request=True)
         else:
             # Python module
-            success, log = attempt_install_pip(module_name, message, manual_request=True)
+            success, log = attempt_install_pip(module_name, message, manual_request=True, user_folder=get_user_folder(user_id))
         
         if success:
             logger.info(f"Admin {admin_id} installed module {module_name} for user {user_id}")
@@ -8585,7 +9401,8 @@ def _show_verdict(message, wait_msg, text):
 
 def _handle_scanned_upload(message, user_id, chat_id, file_name, file_ext, data, wait_msg):
     """Static scan of an upload (the file is never run by the scan). Admin uploads run directly.
-    LOW -> start it, MEDIUM -> hold it for an admin, HIGH -> reject and drop it."""
+    LOW -> start it, MEDIUM or HIGH -> hold it for an admin (a HIGH file is never started unless an admin approves it;
+    the strike counts only when an admin rejects it)."""
     file_type = file_ext[1:]
     if user_id in admin_ids:
         result = _build_result([], file_name, file_type, len(data))
@@ -8609,12 +9426,11 @@ def _handle_scanned_upload(message, user_id, chat_id, file_name, file_ext, data,
     uploader = message.from_user.first_name or message.from_user.username or str(user_id)
     logger.info('Upload scan: user=%s file=%s level=%s', user_id, file_name, level)
     if level == THREAT_HIGH:
-        _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'rejected'))
-        notice = (f"🔴 High-threat upload reject hua: <code>{html_escape(file_name)}</code> from "
-                  f"{html_escape(uploader)} (<code>{user_id}</code>)\n{_reason_lines_html(result, 5)}\n<i>{html_escape(_scan_mode_note(result))}</i>")
-        for admin_id in sorted(admin_ids):
-            _safe_send(admin_id, notice)
-        record_malicious_upload(user_id, file_name, result)
+        token, err = _submit_for_review(user_id, uploader, chat_id, message.message_id, file_name, file_type, data, result)
+        if token:
+            _show_verdict(message, wait_msg, _user_verdict_text(result, file_name, 'held'))
+        else:
+            _show_verdict(message, wait_msg, f"{THREAT_BADGE[level]} Start nahi hua. {html_escape(err)}")
         return
     if level == THREAT_MEDIUM:
         token, err = _submit_for_review(user_id, uploader, chat_id, message.message_id, file_name, file_type, data, result)
@@ -8879,7 +9695,8 @@ def _handle_callbacks(call):
         elif data.startswith('remove_channel_'): admin_required_callback(call, process_remove_channel)
         elif data == 'check_subscription_status': check_subscription_status_callback(call)
         # --- Upload approvals (admins only) ---
-        elif data.startswith('rv_'): admin_required_callback(call, review_callback)
+        elif data.startswith(('rv_', 'hr_')): admin_required_callback(call, review_callback)
+        elif data == 'adm_pending_reviews': admin_required_callback(call, pending_reviews_callback)
         elif data in ('adm_approvals', 'sec_center', 'sec_queue'): admin_required_callback(call, approvals_callback)
         # --- Security Approval Callbacks (older approval buttons that may still be in chats) ---
         elif data.startswith('approve_file_'): admin_required_callback(call, process_approve_file)
@@ -13021,6 +13838,10 @@ if __name__ == '__main__':
         logger.error("Another copy of this bot is already running (same data folder). Stopping this one.")
         logging.shutdown()
         os._exit(1)                  # not sys.exit: the exit hook would stop scripts that belong to the running copy
+    try:
+        sandbox_log_startup()        # find out (by really trying) how strong the isolation of hosted scripts can be here
+    except Exception:
+        logger.exception("Sandbox check failed; hosted scripts will run with the basic protections only")
     keep_alive()
     start_watchdog()
     start_scheduled_restart()
