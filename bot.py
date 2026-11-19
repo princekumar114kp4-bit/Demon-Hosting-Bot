@@ -56,7 +56,7 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 OWNER_ID = _env_int('OWNER_ID', 8597878282)
-ADMIN_ID = _env_int('ADMIN_ID', 8432635520)
+ADMIN_ID = _env_int('ADMIN_ID', 8439335625)
 YOUR_USERNAME = os.environ.get('YOUR_USERNAME', 'U_BOTS_u').strip() or 'U_BOTS_u'
 UPDATE_CHANNEL = os.environ.get('UPDATE_CHANNEL', 'U_BOT_CHANNEL').strip() or 'U_BOT_CHANNEL'
 FREE_USER_LIMIT = _env_int('FREE_USER_LIMIT', 3)
