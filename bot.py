@@ -23,6 +23,7 @@ import atexit
 import requests
 import hashlib
 import secrets
+import stat as _dbf_stat
 import hmac
 import io
 from urllib.parse import urlsplit, urljoin
@@ -206,7 +207,7 @@ REFERRAL_REWARD_DAYS = max(1, _env_int('REFERRAL_REWARD_DAYS', 7))
 PENDING_REFERRALS = {}                   # new user id -> referrer id, kept until the user passes the channel check
 BOT_USERNAME_CACHE = {'name': ''}
 HOST_START_TIME = time.time()
-BOT_VERSION = 'v17'                      # shown in the start-up log, /health and Bot Information: tells which code really runs
+BOT_VERSION = 'v19'                      # shown in the start-up log, /health and Bot Information: tells which code really runs
 SHUTDOWN_EVENT = threading.Event()
 HEALTH_STATE = {'last_poll_start': None, 'poll_restarts': 0, 'last_error': ''}
 user_subscriptions = {}
@@ -1195,7 +1196,7 @@ def ui_brand():
     return f"<i>{UI_BRAND}</i>"
 
 
-def ui_msg(emoji, title, *lines, foot=None, brand=False, progress=None):
+def ui_msg(emoji, title, *lines, foot=None, brand=False, progress=None, tip=None):
     """Header, then the lines (None / '' are skipped), then an optional quiet footer and brand line.
     progress=0..1 turns the accent line into a real progress bar; without it the line is a full divider."""
     body = [str(x) for x in lines if x not in (None, '')]
@@ -1204,8 +1205,10 @@ def ui_msg(emoji, title, *lines, foot=None, brand=False, progress=None):
         out += '\n' + '\n'.join(body)
     if foot:
         out += '\n\n' + ui_note(foot)
+    if tip:
+        out += ('\n' if foot else '\n\n') + ui_note(ui_tip(tip))
     if brand:
-        out += '\n\n' + ui_brand()
+        out += ('\n' if (foot or tip) else '\n\n') + ui_brand()
     return ui_cap(out)
 
 
@@ -1252,26 +1255,38 @@ def ui_bullets(*items, mark='▫️'):
 
 def _ui_card(text):
     """Put the body of a finished card (everything after the divider line) into a quote block.
-    The quiet italic footer lines at the end stay outside. Cards that hold <pre> / a quote already are left alone."""
+    The quiet italic footer lines at the end stay outside. Cards that hold <pre> / a plain quote already are left alone.
+    An expandable quote (logs, long lists) stays as it is; the text around it is quoted separately."""
     try:
-        if '<blockquote' in text or '<pre' in text:
+        if '<pre' in text or '<blockquote>' in text:
             return text
         lines = text.split('\n')
         idx = next((i for i, ln in enumerate(lines[:3]) if _UI_DIVIDER_RX.search(ln)), None)
         if idx is None:
             return text
         head = '\n'.join(lines[:idx + 1])
-        paras = '\n'.join(lines[idx + 1:]).strip('\n').split('\n\n')
-        tail = []
-        while paras and re.fullmatch(r'<i>[^<>\n]*</i>', paras[-1].strip()):
-            tail.insert(0, paras.pop().strip())
-        body = '\n\n'.join(paras).strip('\n')
-        if not body:
+        rest = '\n'.join(lines[idx + 1:]).strip('\n')
+        pieces = re.split(r'(<blockquote expandable>.*?</blockquote>)', rest, flags=re.S)
+        tail = ''
+        last = pieces[-1]
+        paras = last.strip('\n').split('\n\n')
+        tl = []
+        while paras and re.fullmatch(r'(?:<i>[^<>\n]*</i>\n?)+', paras[-1].strip()):
+            tl.insert(0, paras.pop().strip())
+        pieces[-1] = '\n\n'.join(paras).strip('\n')
+        tail = '\n'.join(tl)
+        out = [head]
+        for piece in pieces:
+            if piece.startswith('<blockquote expandable>'):
+                out.append(piece)
+            elif piece.strip('\n'):
+                out.append(f"<blockquote>{piece.strip(chr(10))}</blockquote>")
+        if len(out) == 1:
             return text
-        out = f"{head}\n<blockquote>{body}</blockquote>"
+        res = '\n'.join(out)
         if tail:
-            out += '\n' + '\n'.join(tail)
-        return out
+            res += '\n' + tail
+        return res
     except Exception:
         return text
 
@@ -1356,6 +1371,112 @@ def ui_lead(text):
     """The first visible characters of a message with a leading <b> removed (to look at its marker)."""
     t = str(text).lstrip()
     return t[3:].lstrip() if t.startswith('<b>') else t
+
+
+
+# ---- v18: relative times, rotating tips, expandable quotes, state tags ------------------------------------------------------
+def ui_ago(value, now=None):
+    """A datetime / epoch seconds as '2h ago' (future values and junk give '-')."""
+    try:
+        if isinstance(value, datetime):
+            secs = ((now or datetime.now()) - value).total_seconds()
+        elif isinstance(value, (int, float)):
+            secs = (now.timestamp() if isinstance(now, datetime) else (now or time.time())) - float(value)
+        else:
+            return '-'
+        secs = int(secs)
+        if secs < -60:
+            return '-'
+        if secs < 45:
+            return 'just now'
+        if secs < 3600:
+            return f"{max(1, secs // 60)}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        if secs < 86400 * 30:
+            return f"{secs // 86400}d ago"
+        return f"{secs // (86400 * 30)}mo ago"
+    except Exception:
+        return '-'
+
+
+def ui_in(seconds):
+    """Seconds from now as 'in 3d 4h' / 'in 2h 5m'; zero or less gives 'expired'."""
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return '-'
+    if seconds <= 0:
+        return 'expired'
+    return 'in ' + ui_uptime(seconds)
+
+
+UI_TIPS = {
+    'general': ['Tap Help any time for a quick start guide.',
+                'Keep your scripts small and log with print() so Logs stays useful.',
+                'A .zip upload can hold a whole project with its requirements.txt.',
+                'Use Export Backup now and then, it takes one tap.',
+                'Invite friends with your Referral link to earn free Premium days.'],
+    'files': ['Tap a file to open Start, Stop, Restart, Logs and Environment.',
+              'Put secrets in Environment (.env) instead of writing them in code.',
+              'Export Backup saves all your bots in one zip you can import later.'],
+    'run': ['A script that crashes is restarted for you a few times, check Logs if it keeps stopping.',
+            'Open a script and tap Logs to see what it printed last.',
+            'Changed Environment values apply the next time the script restarts.'],
+}
+_UI_TIP_STEP = itertools.count()
+
+
+def ui_tip(topic='general'):
+    """One rotating pro tip line (italic, with a bulb). Used on only a few screens, never on every message."""
+    pool = UI_TIPS.get(topic) or UI_TIPS['general']
+    return f"💡 Pro tip: {pool[next(_UI_TIP_STEP) % len(pool)]}"
+
+
+def ui_expand(text, limit=1500, tail=True):
+    """Long detail (logs, lists) in a collapsed quote that opens with a tap. Escaped, and cut to `limit` characters
+    (the end is kept when tail=True, because the newest log lines matter most)."""
+    text = str(text or '').strip('\n')
+    if len(text) > limit:
+        text = ('…\n' + text[-limit:]) if tail else (text[:limit] + '\n…')
+        first = text.find('\n')
+        if tail and first != -1 and first < 12 and text.startswith('…'):
+            pass
+    return UIRaw(f"<blockquote expandable>{html_escape(text)}</blockquote>")
+
+
+UI_TAGS = {'active': ('🟢', 'ACTIVE'), 'running': ('🟢', 'RUNNING'), 'stopped': ('🔴', 'STOPPED'), 'premium': ('⭐', 'PREMIUM'),
+           'free': ('🆓', 'FREE'), 'locked': ('🔒', 'LOCKED'), 'unlocked': ('🔓', 'UNLOCKED'), 'admin': ('🛡️', 'ADMIN'),
+           'owner': ('👑', 'OWNER'), 'expired': ('⌛', 'EXPIRED'), 'banned': ('🚫', 'BANNED'), 'suspended': ('⏸️', 'SUSPENDED'),
+           'online': ('🟢', 'ONLINE'), 'offline': ('🔴', 'OFFLINE'), 'warn': ('🟡', 'WARNING'), 'ok': ('🟢', 'OK'),
+           'off': ('⚪', 'OFF'), 'on': ('🟢', 'ON')}
+
+
+def ui_tag(state, text=None):
+    """A bold capital status badge: 'ACTIVE', 'STOPPED', 'PREMIUM', 'FREE', 'LOCKED' with its dot / icon."""
+    icon, word = UI_TAGS.get(str(state).lower(), ('⚪', str(state).upper()))
+    return UIRaw(f"{icon} <b>{ui_esc(text if text is not None else word)}</b>")
+
+
+def ui_meter(emoji, label, value, total, shown=None):
+    """A usage row: 'emoji Label: shown' and a real bar line under it (inside <code> so the bars line up)."""
+    txt = shown if shown is not None else f"{ui_num(value)} / {ui_limit(total)}"
+    return f"{emoji} {ui_esc(label)}: <b>{ui_esc(txt)}</b>\n<code>{ui_bar(value, total)}</code>"
+
+
+def ui_plan(user_id):
+    """('badge html', days_left or None) for the plan of a person: OWNER / ADMIN / PREMIUM / FREE."""
+    try:
+        if user_id == OWNER_ID:
+            return ui_tag('owner'), None
+        if user_id in admin_ids:
+            return ui_tag('admin'), None
+        exp = (user_subscriptions.get(user_id) or {}).get('expiry')
+        if exp and exp > datetime.now():
+            return ui_tag('premium'), max(0, (exp - datetime.now()).days)
+    except Exception:
+        pass
+    return ui_tag('free'), None
 
 
 # the same refusals everywhere
@@ -2012,6 +2133,10 @@ def _nav_clear_input(message):
         _gh_cancel_user(message.from_user.id)
     except Exception:
         pass
+    try:
+        _dbf_wait_drop(message.from_user.id)
+    except Exception:
+        pass
 
 
 def _nav_stale(message):
@@ -2397,8 +2522,31 @@ class SafeTeleBot(telebot.TeleBot):
     rate limits (429) are waited out, 'message is not modified' is ignored, broken
     Markdown/HTML falls back to plain text and stale button presses do not raise."""
 
+    @staticmethod
+    def _soften_markup(args, kwargs, kind, level):
+        """After Telegram refused the formatting: level 1 = an expandable quote becomes a plain quote (still HTML),
+        level 2 = plain text without tags. Returns (args, kwargs)."""
+        kwargs = dict(kwargs)
+        args = list(args)
+        pos = {'send_message': 1, 'edit_message_text': 0}.get(kind)
+        key = 'text' if 'text' in kwargs else ('caption' if 'caption' in kwargs else None)
+        text = kwargs.get(key) if key else (args[pos] if pos is not None and len(args) > pos else None)
+        if isinstance(text, str):
+            if level == 1:
+                new = text.replace('<blockquote expandable>', '<blockquote>')
+            else:
+                new = html_unescape(re.sub(r'</?(?:b|i|u|s|code|pre|a|blockquote|tg-spoiler)(?:\s[^<>]*)?>', '', text)) if kwargs.get('parse_mode') == 'HTML' else text
+            if key:
+                kwargs[key] = new
+            elif pos is not None and len(args) > pos:
+                args[pos] = new
+        if level >= 2:
+            kwargs['parse_mode'] = None
+        return tuple(args), kwargs
+
     def _guard(self, parent, args, kwargs, kind):
-        for attempt in range(4):
+        soft = 0
+        for attempt in range(5):
             try:
                 return parent(*args, **kwargs)
             except telebot.apihelper.ApiTelegramException as exc:
@@ -2416,9 +2564,13 @@ class SafeTeleBot(telebot.TeleBot):
                 if kind == 'delete_message' and ('message to delete not found' in desc or "can't be deleted" in desc):
                     return None
                 if "can't parse entities" in desc and kwargs.get('parse_mode'):
+                    soft += 1
+                    if soft == 1 and kwargs.get('parse_mode') == 'HTML' and 'expandable' in (str(kwargs.get('text') or kwargs.get('caption') or '') + ''.join(str(a) for a in args if isinstance(a, str))):
+                        logger.warning("Expandable quote rejected by Telegram on %s; resending as a normal quote", kind)
+                        args, kwargs = self._soften_markup(args, kwargs, kind, 1)
+                        continue
                     logger.warning("Formatting rejected by Telegram on %s; resending as plain text", kind)
-                    kwargs = dict(kwargs)
-                    kwargs['parse_mode'] = None
+                    args, kwargs = self._soften_markup(args, kwargs, kind, 2)
                     continue
                 if 'message is too long' in desc and kind in ('send_message', 'edit_message_text'):
                     args, kwargs = _truncate_text_args(args, kwargs)
@@ -3150,6 +3302,7 @@ def create_mandatory_channels_menu():
 def create_subscription_check_message(not_joined_channels):
     """Create subscription verification message"""
     message = ui_head('📢', 'Join Our Channels First') + "\n"
+    message += f"🔒 Access: {ui_tag('locked', 'JOIN REQUIRED')}\n\n"
     
     markup = NavMenu()
     
@@ -3172,7 +3325,7 @@ def create_subscription_check_message(not_joined_channels):
             message += "  <i>Private invite link unavailable; contact the bot owner.</i>\n"
     
     markup.add(NavButton("✅ Verify Subscription", callback_data='check_subscription_status'))
-    message += "\n" + ui_note("After joining, tap Verify Subscription.")
+    message += "\n" + ui_steps('Tap Join on each channel above', 'Come back here', 'Tap <b>Verify Subscription</b>') + "\n" + ui_note("Bot unlocks the moment you are verified.")
     
     return message, markup
 
@@ -3327,7 +3480,7 @@ def _lift_expired_temp_bans():
             lifted.append(uid)
             logger.info(f"Temporary ban of user {uid} ended: unbanned automatically")
             try:
-                bot.send_message(uid, "✅ Your temporary ban has ended. You can use the bot again.")
+                bot.send_message(uid, ui_ok('Ban Ended', f"✅ Status: {ui_tag('active')}", 'Your temporary ban has ended.', foot='Send /start to continue.'), parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Failed to notify auto-unbanned user {uid}: {e}")
     return lifted
@@ -3797,7 +3950,7 @@ def process_manual_install_module(message):
         return
     
     if not message.text:
-        bot.reply_to(message, "⚠️ Please send the module name as text.")
+        bot.reply_to(message, ui_warn('Text Needed', 'Please send the module name as text.', foot='Send it again or /cancel.'), parse_mode='HTML')
         return
     module_name = message.text.strip()
     
@@ -3984,20 +4137,25 @@ def credit_referral(new_user_id):
         logger.info(f"Referral counted: {referrer_id} -> {new_user_id} (total {total})")
         if total % REFERRALS_PER_REWARD == 0:
             if referrer_id in admin_ids:
-                reward_note = "Admins already have unlimited uploads, so no extra days were added."
+                reward_note = ui_row('ℹ️', 'Note', 'Admins already have unlimited uploads, so no extra days were added.', bold=False)
             else:
                 current = user_subscriptions.get(referrer_id, {}).get('expiry')
                 start = datetime.now()
                 if current and current > start: start = current
                 new_expiry = start + timedelta(days=REFERRAL_REWARD_DAYS)
                 save_subscription(referrer_id, new_expiry)
-                reward_note = f"⭐ Reward: +{REFERRAL_REWARD_DAYS} days Premium! Expires: {new_expiry:%Y-%m-%d}."
-            msg = f"🎉 Referral #{total} done! {reward_note}"
+                reward_note = (ui_row('⭐', 'Reward', f"+{REFERRAL_REWARD_DAYS} days Premium") + "\n"
+                               + ui_row('📅', 'Premium till', f"{new_expiry:%Y-%m-%d}"))
+            msg = ui_ok('Referral Reward Unlocked', ui_row('👥', 'Referral', f"#{total}"), reward_note,
+                        foot='Shukriya! Aur dosto ko bhejo, aur rewards milte rahenge.')
         else:
             need, _rewards = _referral_progress(total)
-            msg = (f"👥 Ek naya user aapke referral link se join hua! Total referrals: {total}.\n"
-                   f"Next reward ke liye {need} aur chahiye.")
-        _safe_send(referrer_id, html_escape(msg))
+            msg = ui_info('New Referral', 'Ek naya user aapke referral link se join hua!',
+                          ui_row('👥', 'Total referrals', total),
+                          ui_row('🎯', 'Next reward', f"{need} more needed"),
+                          f"<code>{ui_bar(REFERRALS_PER_REWARD - need, REFERRALS_PER_REWARD)}</code>",
+                          foot='Link share karte raho, reward paas hai.')
+        _safe_send(referrer_id, msg)
     except Exception:
         logger.exception("Could not credit the referral of %s", new_user_id)
 
@@ -4091,13 +4249,12 @@ def _files_view(user_id):
     if files:
         running_now = sum(1 for name, _t in files if is_bot_running(user_id, name))
         limit_txt = get_user_file_limit(user_id)
-        text = ui_msg('📂', 'My Files', ui_row('📦', 'Total', len(files)),
-                      ui_row('🟢', 'Running', running_now),
-                      ui_row('🔴', 'Stopped', len(files) - running_now),
-                      f"📊 Slots: <code>{ui_bar(len(files), limit_txt)}</code>",
-                      foot='Tap a file to manage it, or back up / restore all your bots.' + _page_note(page, pages))
+        text = ui_msg('📂', 'My Files',
+                      ui_meter('📦', 'Slots used', len(files), limit_txt, f"{len(files)} / {ui_limit(limit_txt)}"),
+                      f"{ui_tag('active')}: <b>{running_now}</b>   {ui_tag('stopped')}: <b>{len(files) - running_now}</b>",
+                      foot='Tap a file to manage it, or back up / restore all your bots.' + _page_note(page, pages), tip='files')
     else:
-        text = ui_msg('📂', 'My Files', ui_row('📦', 'Total', 0),
+        text = ui_msg('📂', 'My Files', ui_tag('stopped', 'NO FILES YET'),
                       "\n🌱 Abhi koi file upload nahi hui.",
                       ui_bullets('📥 Purana backup hai? Import Backup dabao.', '🚀 Naya hai? Upload Script dabao.'),
                       foot='Your bots will show up here.')
@@ -5085,7 +5242,7 @@ def _handle_pending_import_upload(message):
     except Exception:
         logger.exception('Restore upload failed')
         _discard_wait(uid)
-        bot.reply_to(message, '⚠️ Something went wrong while checking that file. Nothing was changed.')
+        bot.reply_to(message, ui_warn('Something Went Wrong', 'Something went wrong while checking that file.', foot='Nothing was changed.'), parse_mode='HTML')
     return True
 
 
@@ -6019,6 +6176,8 @@ def create_control_buttons(script_owner_id, file_name, is_running=True):
         opted_out = _script_key(script_owner_id, file_name) in SCHEDULED_RESTART_OPTOUT
         markup.row(NavButton(f"⏰ Scheduled Restart: {'OFF' if opted_out else 'ON'}",
                              callback_data=f'srt_{script_owner_id}_{file_name}'))
+    if getattr(_ACTOR, 'uid', None) in (None, script_owner_id):     # v19: only the owner sees his bot's data files
+        markup.row(NavButton("🗄️ Data Files", callback_data=f'dbf_e_{script_owner_id}_{file_name}'))
     markup.row(
         NavButton("📦 Export My Bots", callback_data=f'ubk_{script_owner_id}'),
         NavButton("♻️ Import My Bots", callback_data=f'ubr_{script_owner_id}')
@@ -7064,7 +7223,7 @@ def _gh_receive_link(message, actor_id):
     user_id = message.from_user.id
     text = getattr(message, 'text', None)
     if user_id != actor_id or not text:
-        sent = bot.send_message(chat_id, '⚠️ Link text mein bhejo, jaise https://github.com/owner/repo')
+        sent = bot.send_message(chat_id, ui_warn('Text Needed', 'Link text mein bhejo, jaise https://github.com/owner/repo', foot='Dobara link bhejo, ya Cancel dabao.'), parse_mode='HTML')
         bot.register_next_step_handler(sent, _gh_receive_link, actor_id)
         return
     try:
@@ -7074,7 +7233,7 @@ def _gh_receive_link(message, actor_id):
         bot.register_next_step_handler(sent, _gh_receive_link, actor_id)
         return
     if is_user_banned(user_id) or (bot_locked and user_id not in admin_ids):
-        bot.send_message(chat_id, '⚠️ Abhi deploy nahi ho sakta.')
+        bot.send_message(chat_id, ui_warn('Heads Up', 'Abhi deploy nahi ho sakta.', foot='Thodi der baad dobara try karo.'), parse_mode='HTML')
         return
     if not _upload_limit_ok(user_id, chat_id):
         return
@@ -7164,7 +7323,7 @@ def _gh_apply_update(extract_dir, manifest, user_id, user_folder, message, state
     info, side = gh_read_sidecar(user_folder, main)
     entry = next((item for item in user_files.get(user_id, []) if item[0] == main), None)
     if info is None or info['url'] != manifest.get('repo') or entry is None or not os.path.isfile(os.path.join(user_folder, main)):
-        bot.reply_to(message, '❌ Update nahi hua: is bot ka GitHub source ya file ab maujood nahi hai. Purana version waise hi hai.')
+        bot.reply_to(message, ui_err('Could Not Do That', 'Update nahi hua: is bot ka GitHub source ya file ab maujood nahi hai.', foot='Purana version waise hi hai.'), parse_mode='HTML')
         return
     file_type = entry[1]
     known = set(side.get('files') or [])
@@ -7194,7 +7353,7 @@ def _gh_apply_update(extract_dir, manifest, user_id, user_folder, message, state
             else:
                 plan.append((rel, src, dest, 'new'))
     if main not in {rel for rel, _, _, _ in plan}:
-        bot.reply_to(message, '❌ Update nahi hua: main file update list mein nahi aayi. Purana version waise hi hai.')
+        bot.reply_to(message, ui_err('Could Not Do That', 'Update nahi hua: main file update list mein nahi aayi.', foot='Purana version waise hi hai.'), parse_mode='HTML')
         return
     if os.path.isfile(os.path.join(extract_dir, 'requirements.txt')):
         if not _install_zip_deps(extract_dir, message, user_id, safe=True, do_npm=False):
@@ -7227,7 +7386,7 @@ def _gh_apply_update(extract_dir, manifest, user_id, user_folder, message, state
     except OSError as exc:
         logger.error('GitHub update copy failed: %s', exc)
         rollback()
-        bot.reply_to(message, '❌ Update ke beech file likhne mein dikkat aayi. Purani files wapas rakh di, kuch nahi badla.')
+        bot.reply_to(message, ui_err('Could Not Do That', 'Update ke beech file likhne mein dikkat aayi.', foot='Purani files wapas rakh di, kuch nahi badla.'), parse_mode='HTML')
         return
     if any(rel == 'package.json' for rel, _, _ in touched):
         if not _install_zip_deps(user_folder, message, user_id, safe=True, do_pip=False):
@@ -7829,9 +7988,10 @@ def _run_status_end(text):
 def _start_card(kind, file_name, pid, owner_id):
     """The 'script started' card (kind is 'Python' or 'JS')."""
     return ui_ok(f'{kind} Script Started',
-                 ui_row('📡', 'Status', ui_badge('run', 'Running'), bold=False),
+                 f"📡 Status: {ui_tag('active')}",
                  ui_row('📄', 'File', file_name, code=True),
                  ui_row('🆔', 'PID', pid, code=True),
+                 ui_row('⏱️', 'Uptime', 'just started'),
                  ui_row('👤', 'Owner', owner_id, code=True),
                  ui_row('🧱', 'Sandbox', get_sandbox_name(owner_id)),
                  ui_row('🛡️', 'Isolation', sandbox_level_text()),
@@ -8113,26 +8273,51 @@ def _run_js_script_impl(script_path, script_owner_id, user_folder, file_name, me
              kill_process_tree(stale)
 
 # --- Logic Functions (called by commands and text handlers) ---
+def _user_running(user_id):
+    """[(file_name, key, uptime_seconds or None)] of the scripts this person has running right now."""
+    out = []
+    for key, info in list(bot_scripts.items()):
+        try:
+            if int(info.get('script_owner_id', -1)) != user_id:
+                continue
+            proc = info.get('process')
+            if proc and proc.poll() is None:
+                started = info.get('start_time')
+                up = (datetime.now() - started).total_seconds() if isinstance(started, datetime) else None
+                out.append((info.get('file_name', 'Unknown'), key, up))
+        except Exception:
+            continue
+    return out
+
+
 def _main_menu_text(user_name, user_id, user_status, days_left, current_files, limit_str, back=False):
     """The main-menu card (welcome and 'back to main')."""
     try:
-        used_bar = ui_bar(current_files, int(limit_str.replace(',', ''))) if str(limit_str).replace(',', '').isdigit() else ui_bar(1, 0)
+        limit_num = int(str(limit_str).replace(',', '')) if str(limit_str).replace(',', '').isdigit() else 0
     except Exception:
-        used_bar = ui_bar(1, 0)
+        limit_num = 0
+    try:
+        live = len(_user_running(user_id))
+    except Exception:
+        live = 0
+    hour = datetime.now().hour
+    hello = 'Good morning' if 5 <= hour < 12 else ('Good afternoon' if 12 <= hour < 17 else ('Good evening' if 17 <= hour < 22 else 'Hello'))
+    plan_tag = ui_plan(user_id)[0]
     return ui_msg('💎', 'DEMON HOSTING',
-                  f"👋 {'Welcome back' if back else 'Welcome'}, <b>{ui_esc(user_name)}</b>",
-                  "<i>Your premium Python and JavaScript hosting, ready 24/7.</i>\n",
+                  f"👋 {'Welcome back' if back else hello}, <b>{ui_esc(user_name)}</b>",
+                  "<i>Your premium Python and JavaScript hosting, live 24/7.</i>\n",
                   ui_row('🆔', 'User ID', user_id, code=True),
-                  ui_row('👑', 'Plan', user_status),
-                  ui_row('⏳', 'Expires in', f"{days_left} days") if days_left is not None else None,
-                  ui_row('📁', 'Storage', f"{current_files} / {limit_str} files"),
-                  f"📊 Usage: <code>{used_bar}</code>",
+                  f"👑 Plan: {plan_tag}",
+                  ui_row('⏳', 'Days left', f"{days_left} days") if days_left is not None else None,
+                  ui_section('📊', 'Your hosting'),
+                  ui_meter('📁', 'File slots', current_files, limit_num, f"{current_files} / {limit_str}"),
+                  f"{'🟢' if live else '⚪'} Running now: <b>{ui_num(live)}</b> {'script' if live == 1 else 'scripts'}",
                   ui_section('✨', 'What you can do'),
                   ui_bullets('🚀 Deploy .py, .js and .zip projects',
                              '⚡ Start, stop and restart in one tap',
                              '🧩 Install modules and read live logs',
                              '🛡️ Isolated sandbox for every user'),
-                  foot='Pick an option from the control panel below.', brand=True)
+                  foot='Pick an option from the control panel below.', brand=True, tip='general')
 
 def _logic_send_welcome(message):
     user_id = message.from_user.id
@@ -8274,8 +8459,8 @@ def _logic_bot_speed(message):
         speed_msg = ui_msg('⚡', 'Bot Speed & Status',
                            ui_row('⏱️', 'API Response', f"{response_time} ms"),
                            ui_row('📶', 'Speed', ui_badge('ok' if response_time < 800 else 'warn', 'Fast' if response_time < 400 else ('Good' if response_time < 800 else 'Slow')), bold=False),
-                           ui_row('🚦', 'Bot Status', status),
-                           ui_row('👤', 'Your Level', user_level),
+                           f"🚦 Bot Status: {ui_tag('locked') if bot_locked else ui_tag('unlocked')}",
+                           f"👤 Your Level: {ui_plan(user_id)[0]}",
                            brand=True)
         _say_via(pm, chat_id, speed_msg)
     except Exception as e:
@@ -8353,20 +8538,22 @@ def _logic_statistics(message):
             if int(s_owner_id) == user_id:
                 user_running_bots +=1
 
-    stat_rows = [ui_row('👥', 'Total Users', ui_num(total_users)),
+    stat_rows = [ui_section('🌐', 'Platform'),
+                 ui_row('👥', 'Total Users', ui_num(total_users)),
                  ui_row('🚫', 'Banned Users', ui_num(len(banned_users))),
                  ui_row('📂', 'File Records', ui_num(total_files_records)),
-                 ui_row('🟢', 'Active Bots', ui_num(running_bots_count))]
+                 ui_meter('🟢', 'Active Bots', running_bots_count, total_files_records, f"{ui_num(running_bots_count)} of {ui_num(total_files_records)}") if total_files_records else ui_row('🟢', 'Active Bots', ui_num(running_bots_count))]
     if user_id in admin_ids:
-        stat_rows += [ui_row('🔒', 'Bot Status', ui_badge('off', 'Locked') if bot_locked else ui_badge('on', 'Unlocked'), bold=False),
+        stat_rows += [ui_section('🛠️', 'Admin view'),
+                      f"🔒 Bot Status: {ui_tag('locked') if bot_locked else ui_tag('unlocked')}",
                       ui_row('📢', 'Mandatory Channels', ui_num(len(mandatory_channels))),
                       ui_row('⚙️', 'Custom Limits', ui_num(len(user_limits)))]
         if AUTO_BACKUP_MINUTES <= 0:
             stat_rows.append(ui_row('💾', 'Auto Backup', 'Off'))
         else:
             stat_rows += [ui_esc(line) for line in auto_backup_status_lines()]
-    stat_rows.append(ui_row('🤖', 'Your Running Bots', ui_num(user_running_bots)))
-    bot.reply_to(message, ui_msg('📊', 'Bot Statistics', *stat_rows, brand=True), parse_mode='HTML')
+    stat_rows += [ui_section('🙋', 'You'), ui_row('🤖', 'Your Running Bots', ui_num(user_running_bots))]
+    bot.reply_to(message, ui_msg('📊', 'Bot Statistics', *stat_rows, brand=True, tip='general'), parse_mode='HTML')
 
 def _logic_broadcast_init(message):
     if message.from_user.id not in admin_ids:
@@ -8519,12 +8706,22 @@ def _logic_run_all_scripts(message_or_call):
     logger.info(f"Run all scripts finished. Admin: {admin_user_id}. Started: {started_count}. Skipped/Errors: {skipped_files}")
 
 # --- New Admin Functions for Channel Management ---
+def _channels_card():
+    """Mandatory-channel dashboard: how many channels are enforced and the access gate state."""
+    n = len(mandatory_channels)
+    return ui_msg('📢', 'Mandatory Channels',
+                  f"🔒 Join gate: {ui_tag('active', 'ENFORCED') if n else ui_tag('off', 'NOT SET')}",
+                  ui_row('📢', 'Channels', ui_num(n)),
+                  (ui_bullets('Add a channel so new users must join first', 'Bot must be admin in that channel') if not n else None),
+                  foot='Use the buttons below to add, list or remove channels.')
+
+
 def _logic_manage_mandatory_channels(message):
     """Manage mandatory channels - for admin only"""
     if message.from_user.id not in admin_ids:
         bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML')
         return
-    bot.reply_to(message, ui_msg('📢', 'Mandatory Channels', foot='Use the buttons below.'), reply_markup=create_mandatory_channels_menu(), parse_mode='HTML')
+    bot.reply_to(message, _channels_card(), reply_markup=create_mandatory_channels_menu(), parse_mode='HTML')
 
 def _logic_admin_install(message):
     """Admin manual installation for users"""
@@ -8803,6 +9000,14 @@ def _handle_file_upload_doc_body(message):
         bot.reply_to(message, subscription_message, reply_markup=markup, parse_mode='HTML')
         return
 
+    # v19: a data file that was asked for with Upload Data File / Replace (only while that screen is the last one shown).
+    _dbf_pending = _dbf_wait_get(user_id)
+    if _dbf_pending is not None:
+        if _dbf_pending.get('seq') is not None and _dbf_pending.get('seq') == (_nav_get(chat_id) or {}).get('seq'):
+            _dbf_receive_upload(message, _dbf_pending)
+            return
+        _dbf_wait_drop(user_id)
+
     # A database / bot-data import that is waiting for its file takes this upload.
     if _handle_pending_import_upload(message):
         return
@@ -8947,6 +9152,7 @@ def _handle_callbacks(call):
         elif data.startswith('ghu_'): gh_update_callback(call)
         elif data == 'check_files': check_files_callback(call)
         elif data.startswith('file_'): file_control_callback(call)
+        elif data.startswith('dbf_'): dbf_callback(call)
         elif data.startswith('start_'): start_bot_callback(call)
         elif data.startswith('stop_'): stop_bot_callback(call)
         elif data.startswith('restart_'): restart_bot_callback(call)
@@ -9058,27 +9264,21 @@ def user_account_callback(call):
     limit = get_user_file_limit(user_id)
     limit_text = ui_limit(limit)
     files_count = get_user_file_count(user_id)
-    running_count = 0
-    for key, info in list(bot_scripts.items()):
-        try:
-            if int(info.get('script_owner_id', -1)) == user_id and info.get('process') and info['process'].poll() is None:
-                running_count += 1
-        except Exception:
-            continue
     sub = user_subscriptions.get(user_id, {})
     expiry = sub.get('expiry')
     expiry_text = ui_date(expiry) if expiry and expiry > datetime.now() else 'Not active'
     premium_on = bool(expiry and expiry > datetime.now())
+    plan_tag, left = ui_plan(user_id)
+    live = _user_running(user_id)
     text = ui_msg('👑', 'MY ACCOUNT',
                   ui_row('🆔', 'ID', user_id, code=True),
-                  ui_row('💎', 'Plan', _user_plan_label(user_id)),
-                  ui_row('⭐', 'Premium', ui_badge('on', 'Active') if premium_on else ui_badge('off', 'Not active'), bold=False),
-                  ui_row('⏳', 'Valid till', expiry_text) if premium_on else None,
+                  f"💎 Plan: {plan_tag}",
+                  f"⭐ Premium: {ui_tag('active', 'UNLIMITED') if user_id in admin_ids or user_id == OWNER_ID else (ui_tag('active') if premium_on else ui_tag('off', 'NOT ACTIVE'))}",
+                  ui_row('⏳', 'Valid till', f"{expiry_text} ({left}d left)" if premium_on and left is not None else expiry_text) if premium_on else None,
                   ui_section('📊', 'Usage'),
-                  ui_row('📁', 'Files', f"{files_count} / {limit_text}"),
-                  f"<code>{ui_bar(files_count, limit)}</code>",
-                  ui_row('🟢', 'Running scripts', running_count),
-                  foot='Your account and hosting usage at a glance.', brand=True)
+                  ui_meter('📁', 'File slots', files_count, limit, f"{files_count} / {limit_text}"),
+                  ui_meter('🟢', 'Running scripts', len(live), files_count, f"{len(live)} of {files_count}") if files_count else ui_row('🟢', 'Running scripts', 0),
+                  foot='Need more slots? Premium or a Referral reward adds them.' if not premium_on and user_id not in admin_ids else 'Your account and hosting usage at a glance.', brand=True)
     kb = NavMenu(row_width=2)
     kb.row(NavButton('📂 Manage Files', callback_data='check_files'),
            NavButton('🤖 Running Bots', callback_data='my_running'))
@@ -9132,11 +9332,19 @@ def my_running_callback(call):
             owner_part, file_part = key.split('_', 1)
             kb.add(NavButton(f'🟢 {name}', callback_data=f'file_{owner_part}_{file_part}'))
         kb.pager('running', 'my_running', page, pages)
+        ups = {k: u for _n, k, u in _user_running(user_id)}
+        lines = []
+        for name, key in shown:
+            up = ups.get(key)
+            lines.append(f"{ui_tag('active')} <code>{ui_esc(str(name)[:40])}</code>" + (f" · up {ui_uptime(up)}" if up is not None else ''))
         body = ui_msg('🤖', 'MY RUNNING BOTS',
-                      ui_row('🟢', 'Status', ui_badge('run', f'{ui_num(len(rows))} live'), bold=False),
-                      foot='Select a script to open its controls.' + _page_note(page, pages))
+                      f"📡 Live: <b>{ui_num(len(rows))}</b> {'script' if len(rows) == 1 else 'scripts'}",
+                      *lines,
+                      foot='Select a script to open its controls.' + _page_note(page, pages), tip='run')
     else:
-        body = ui_msg('🤖', 'MY RUNNING BOTS', ui_badge('stop', 'Nothing is running right now'),
+        body = ui_msg('🤖', 'MY RUNNING BOTS', f"{ui_tag('stopped', 'NOTHING RUNNING')}",
+                      "\n🌱 Koi script abhi chal nahi rahi.",
+                      ui_bullets('📂 Open My Files and pick a script', '▶️ Tap Start, it goes live in seconds'),
                       foot='Upload a script or start one from My Files.')
     kb.add(NavButton('📂 My Files', callback_data='check_files'))
     kb.add(NavButton('🏠 Main Menu', callback_data='back_to_main'))
@@ -9182,8 +9390,8 @@ def admin_dashboard_callback(call):
                   ui_row('📦', 'Stored scripts', ui_num(total_files)),
                   ui_row('🟢', 'Running processes', ui_num(running)),
                   ui_row('🔁', 'Restart limit reached', ui_num(exhausted)),
-                  ui_row('🔐', 'Service mode', 'Maintenance' if bot_locked else 'Online'),
-                  (f"<code>{ui_bar(running, total_files)}</code> scripts live" if total_files else None),
+                  f"🔐 Service mode: {ui_tag('locked', 'MAINTENANCE') if bot_locked else ui_tag('online')}",
+                  ui_meter('🟢', 'Scripts live', running, total_files, f"{ui_num(running)} of {ui_num(total_files)}") if total_files else None,
                   foot='Administrative tools and quick operations.', brand=True)
     kb = NavMenu(row_width=2)
     kb.row(NavButton('🩺 Hosting Health', callback_data='hosting_health'),
@@ -9334,14 +9542,922 @@ def check_files_callback(call):
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=menu, parse_mode='HTML')
 
 def _control_panel_text(owner_id, file_name, file_type, status_text, source_url=None):
-    """The script control panel: file, type, owner and status as label : value rows (HTML)."""
+    """The script control panel: status badge, file, type, owner, uptime and (after a stop) the last log lines."""
+    st = str(status_text)
+    running = 'Running' in st
+    starting = (not running) and ('starting' in st.lower())
+    key = _script_key(owner_id, file_name)
+    up = None
+    try:
+        info = bot_scripts.get(key)
+        if running and info and isinstance(info.get('start_time'), datetime):
+            up = (datetime.now() - info['start_time']).total_seconds()
+    except Exception:
+        up = None
+    tail = ''
+    if not running and not starting:
+        try:
+            tail = _log_tail({'user_folder': get_user_folder(owner_id), 'file_name': file_name}, lines=6, limit=700)
+        except Exception:
+            tail = ''
     return ui_msg('⚙️', 'Script Controls',
-                  ui_row('📡', 'Status', status_text),
+                  f"📡 Status: {ui_tag('active') if running else (ui_tag('warn', 'STARTING') if starting else ui_tag('stopped'))}",
                   ui_row('📄', 'File', file_name, code=True),
                   ui_row('🧩', 'Type', str(file_type).upper()),
                   ui_row('👤', 'Owner', owner_id, code=True),
+                  ui_row('⏱️', 'Uptime', ui_uptime(up)) if up is not None else None,
                   ui_row('🐙', 'Source', source_url, code=True) if source_url else None,
-                  foot='Use the buttons below: Start / Stop, Restart, Logs and Environment.')
+                  ("👇 Last log lines:" if tail else None), (ui_expand(tail, 700) if tail else None),
+                  foot=('Still starting. Open My Files again in a moment.' if starting else
+                        'Use the buttons below: Start / Stop, Restart, Logs and Environment.'))
+
+
+# ---- v19: Data Files viewer (inside ONE bot's own control panel) -----------------------------------------------------
+# A user can look at the data files (.db .json .csv ...) of ONE of his own bots, download / preview / delete them and
+# upload (add or replace) a data file. There is no list of "all my databases": the viewer is opened from a bot's panel and
+# shows only the files that belong to THAT bot. Rule (user files live flat in one folder, so this is a plain, honest guess):
+# a data file belongs to a bot when (1) it is inside a folder named after the bot (bot, bot_data, bot-data ...), or
+# (2) its name starts with the bot's name (bot.db, bot_users.json; the longest matching bot name wins), or (3) the bot's
+# own code (and the code files that came with it from GitHub) writes its name in quotes ("users.json"), or (4) it came with
+# the bot's GitHub files. A file inside ANOTHER bot's own folder is only shown when this bot's code names its full path.
+# A file that two bots mention in their code is shown in both. Nothing found -> an honest empty screen.
+DBF_EXTS = ('.db', '.sqlite', '.sqlite3', '.json', '.jsonl', '.csv', '.pkl', '.pickle', '.dat')
+DBF_SQLITE_EXTS = ('.db', '.sqlite', '.sqlite3')
+DBF_ICONS = {'.db': '🗃', '.sqlite': '🗃', '.sqlite3': '🗃', '.json': '🧾', '.jsonl': '🧾', '.csv': '📊',
+             '.pkl': '🥒', '.pickle': '🥒', '.dat': '💾'}
+DBF_MAX_FILES = 200
+DBF_MAX_DEPTH = 4                      # folders below the user's folder that are searched
+DBF_WALK_LIMIT = 6000                  # directory entries looked at in one search
+DBF_UPLOAD_MAX = 20 * 1024 * 1024
+DBF_DOWNLOAD_MAX = 50 * 1024 * 1024    # what a bot may send as a document
+DBF_TOKEN_TTL = 1800
+DBF_WRITE_TTL = 300
+DBF_WAIT_TTL = 120
+DBF_TOKEN_MAX_PER_USER = 250
+DBF_SRC_MAX = 1_000_000
+DBF_SKIP_DIRS = {'node_modules', 'pylibs', 'site-packages', '__pycache__', '.git', '.hostsave', 'sandbox_data', 'venv', '.venv',
+                 '.cache', '.npm', '.local', '.config'}
+DBF_SKIP_FILES = {'requirements.txt', 'package.json', 'package-lock.json', 'tsconfig.json', 'jsconfig.json', 'composer.json',
+                  'pipfile.lock', 'yarn.lock', 'pyproject.toml'}
+DBF_BAD_UPLOAD_EXTS = {'.py', '.js', '.mjs', '.cjs', '.ts', '.sh', '.bash', '.zip', '.exe', '.dll', '.so', '.bat', '.cmd', '.ps1',
+                       '.jar', '.php', '.rb', '.pl', '.env', '.tar', '.gz', '.rar', '.7z', '.apk', '.msi', '.bin', '.com', '.scr'}
+DBF_TOKENS = {}
+DBF_WAIT = {}                          # uid -> {'owner','script','mode','rel','time'}: the next document is a data file
+DBF_LOCK = threading.RLock()
+_DBF_REF_RX = re.compile(r"""(['"])([^'"\n\\{}]{1,200}?\.(?:db|sqlite3?|json|jsonl|csv|pkl|pickle|dat))\1""", re.I)
+
+
+def _dbf_icon(name):
+    return DBF_ICONS.get(os.path.splitext(name)[1].lower(), '📄')
+
+
+def _dbf_is_data_name(name):
+    """A file name that may be shown as a data file (data extension, not a config / hidden / helper file)."""
+    low = str(name).lower()
+    if not low or low.startswith('.') or os.path.splitext(low)[1] not in DBF_EXTS:
+        return False
+    if low in DBF_SKIP_FILES or low.startswith('tsconfig') or low.endswith(GH_SIDECAR_SUFFIX) or '.hostsave' in low:
+        return False
+    return True
+
+
+def _dbf_skip_dir(name):
+    low = str(name).lower()
+    return low in DBF_SKIP_DIRS or low.startswith('.') or low.endswith(('.dist-info', '.egg-info'))
+
+
+def _dbf_token_new(uid, owner, script, **fields):
+    now = time.time()
+    with DBF_LOCK:
+        for key in [k for k, e in DBF_TOKENS.items() if now - e['time'] > (DBF_WRITE_TTL if e.get('kind') == 'write' else DBF_TOKEN_TTL)]:
+            DBF_TOKENS.pop(key, None)
+        mine = [k for k, e in DBF_TOKENS.items() if e['uid'] == uid]
+        if fields.get('kind') == 'write':
+            for key in [k for k in mine if DBF_TOKENS[k].get('kind') == 'write']:
+                DBF_TOKENS.pop(key, None)
+        elif len(mine) >= DBF_TOKEN_MAX_PER_USER:
+            for key in sorted(mine, key=lambda k: DBF_TOKENS[k]['time'])[:len(mine) - DBF_TOKEN_MAX_PER_USER + 20]:
+                DBF_TOKENS.pop(key, None)
+        tok = secrets.token_hex(5)
+        DBF_TOKENS[tok] = dict(uid=uid, owner=owner, script=script, time=now, **fields)
+    return tok
+
+
+def _dbf_token_get(tok, uid, owner=None, script=None):
+    """The entry of a token, only for the person it was made for, the bot it was made for, and while it is fresh."""
+    with DBF_LOCK:
+        ent = DBF_TOKENS.get(str(tok))
+        if not ent:
+            return None
+        ttl = DBF_WRITE_TTL if ent.get('kind') == 'write' else DBF_TOKEN_TTL
+        if time.time() - ent['time'] > ttl:
+            DBF_TOKENS.pop(str(tok), None)
+            return None
+        if ent['uid'] != uid or ent['owner'] != uid:
+            return None
+        if script is not None and ent['script'] != script:
+            return None
+        return ent
+
+
+def _dbf_wait_drop(uid):
+    with DBF_LOCK:
+        DBF_WAIT.pop(uid, None)
+
+
+def _dbf_wait_get(uid):
+    with DBF_LOCK:
+        ent = DBF_WAIT.get(uid)
+        if ent and time.time() - ent['time'] > DBF_WAIT_TTL:
+            DBF_WAIT.pop(uid, None)
+            return None
+        return dict(ent) if ent else None
+
+
+def _dbf_script_names(owner):
+    return [f[0] for f in user_files.get(owner, []) if isinstance(f, (list, tuple)) and f]
+
+
+def _dbf_read_refs(path, refs, budget):
+    """Data file names written in quotes in one source file (bounded read). Returns the bytes still allowed."""
+    try:
+        if budget <= 0 or not os.path.isfile(path) or os.path.islink(path):
+            return budget
+        with open(path, 'rb') as handle:
+            text = handle.read(min(DBF_SRC_MAX, budget)).decode('utf-8', 'ignore')
+        for m in _DBF_REF_RX.finditer(text):
+            tok = m.group(2).strip().replace('\\', '/').lower()
+            while tok.startswith('./'):
+                tok = tok[2:]
+            if tok and not tok.startswith('/') and '..' not in tok.split('/'):
+                refs.add(tok)
+        return budget - len(text)
+    except Exception:
+        return budget
+
+
+def _dbf_own_dirs(stem):
+    return {stem, stem + '_data', stem + '-data', stem + '_db', stem + '-db', stem + '_files', 'data_' + stem} if stem else set()
+
+
+def _dbf_ctx(owner, script):
+    """Everything needed to decide which data files belong to one bot (read fresh on every action)."""
+    folder = get_user_folder(owner)
+    root = os.path.realpath(folder)
+    stem = os.path.splitext(script)[0].lower()
+    refs = set()
+    budget = DBF_SRC_MAX
+    gh = set()
+    try:
+        info, data = gh_read_sidecar(root, script)
+        if data:
+            for x in data.get('files', []):
+                if isinstance(x, str):
+                    rel = x.replace('\\', '/')
+                    while rel.startswith('./'):
+                        rel = rel[2:]
+                    gh.add(rel.lower())
+    except Exception:
+        gh = set()
+    if not script.lower().endswith('.zip'):
+        budget = _dbf_read_refs(os.path.join(root, script), refs, budget)
+    # the other code files that came with this bot from GitHub also count as "its code"
+    for rel in sorted(gh)[:60]:
+        if rel.endswith(('.py', '.js', '.mjs', '.cjs', '.ts')) and '..' not in rel.split('/') and not rel.startswith('/'):
+            real = os.path.realpath(os.path.join(root, rel))
+            if os.path.commonpath([real, root]) == root:
+                budget = _dbf_read_refs(real, refs, budget)
+    others = [os.path.splitext(n)[0].lower() for n in _dbf_script_names(owner) if n != script]
+    other_dirs = set()
+    for o in others:
+        other_dirs |= _dbf_own_dirs(o)
+    other_dirs -= _dbf_own_dirs(stem)
+    return {'owner': owner, 'script': script, 'root': root, 'stem': stem, 'refs': refs, 'gh': gh, 'others': others,
+            'other_dirs': other_dirs}
+
+
+def _dbf_why(ctx, rel):
+    """Why a file belongs to this bot ('folder' / 'name' / 'code' / 'github'), or None when it does not."""
+    low = rel.replace('\\', '/').lower()
+    parts = low.split('/')
+    base = parts[-1]
+    stem = ctx['stem']
+    if stem and any(p in _dbf_own_dirs(stem) for p in parts[:-1]):
+        return 'folder'
+    in_other = any(p in ctx['other_dirs'] for p in parts[:-1])     # inside ANOTHER bot's own folder
+    for tok in ctx['refs']:
+        if low == tok:                                              # exact path written in this bot's code
+            return 'code'
+    if low in ctx['gh']:
+        return 'github'
+    if in_other:
+        return None
+    fstem = os.path.splitext(base)[0]
+
+    def fits(s):
+        return len(s) >= 3 and (fstem == s or (fstem.startswith(s) and not fstem[len(s)].isalnum()))
+    if len(parts) == 1 and fits(stem) and not any(fits(o) and len(o) > len(stem) for o in ctx['others']):
+        return 'name'
+    for tok in ctx['refs']:
+        if '/' not in tok and base == tok:                          # name in the code, file kept in a sub folder
+            return 'code'
+        if '/' in tok and low.endswith('/' + tok):
+            return 'code'
+    return None
+
+
+def _dbf_collect(ctx):
+    """[{'rel','name','size','mtime','why'}] of this bot's data files, newest search result capped at DBF_MAX_FILES."""
+    root = ctx['root']
+    found, seen = [], 0
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, root)
+        depth = 0 if rel_dir == '.' else rel_dir.count(os.sep) + 1
+        if depth >= DBF_MAX_DEPTH:
+            dirnames[:] = []
+        else:
+            dirnames[:] = [d for d in sorted(dirnames) if not _dbf_skip_dir(d) and not os.path.islink(os.path.join(dirpath, d))]
+        for fn in sorted(filenames):
+            seen += 1
+            if seen > DBF_WALK_LIMIT:
+                truncated = True
+                break
+            if not _dbf_is_data_name(fn):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if not _dbf_stat.S_ISREG(st.st_mode):
+                continue
+            rel = fn if rel_dir == '.' else rel_dir.replace(os.sep, '/') + '/' + fn
+            why = _dbf_why(ctx, rel)
+            if why:
+                found.append({'rel': rel, 'name': fn, 'size': st.st_size, 'mtime': st.st_mtime, 'why': why})
+        if seen > DBF_WALK_LIMIT:
+            break
+    found.sort(key=lambda e: e['rel'].lower())
+    if len(found) > DBF_MAX_FILES:
+        found, truncated = found[:DBF_MAX_FILES], True
+    return found, truncated
+
+
+def _dbf_resolve(ctx, rel, must_exist=True):
+    """(full path, None) when `rel` is a data file of THIS bot inside the user's own folder and no part of it is a symlink;
+    otherwise (None, reason)."""
+    if not isinstance(rel, str) or not rel or '\x00' in rel or rel.startswith('/') or '\\' in rel:
+        return None, 'path'
+    parts = rel.split('/')
+    if len(parts) > DBF_MAX_DEPTH + 1 or any(p in ('', '.', '..') for p in parts):
+        return None, 'path'
+    if any(_dbf_skip_dir(p) for p in parts[:-1]) or not _dbf_is_data_name(parts[-1]):
+        return None, 'kind'
+    root = ctx['root']
+    cur = root
+    for p in parts:
+        cur = os.path.join(cur, p)
+        if os.path.islink(cur):
+            return None, 'link'
+    full = os.path.join(root, *parts)
+    real = os.path.realpath(full)
+    if real != full or os.path.commonpath([real, root]) != root:
+        return None, 'path'
+    if not _dbf_why(ctx, rel):
+        return None, 'scope'
+    if must_exist:
+        try:
+            st = os.lstat(full)
+        except OSError:
+            return None, 'gone'
+        if not _dbf_stat.S_ISREG(st.st_mode):
+            return None, 'kind'
+    return full, None
+
+
+def _dbf_clean_name(raw):
+    """A safe file name from what the user's file was called: plain name only, no folders, no dots at the start.
+    Returns (name, None) or (None, reason text)."""
+    import unicodedata
+    text = unicodedata.normalize('NFKC', str(raw or '')).replace('\\', '/')
+    base = text.split('/')[-1].strip()
+    base = ''.join(ch for ch in base if ch.isprintable())
+    if not base or base in ('.', '..'):
+        return None, 'File ka naam samajh nahi aaya.'
+    if base.startswith('.'):
+        return None, 'Chhupi hui (dot se shuru hone wali) files allowed nahi hain.'
+    stem, ext = os.path.splitext(base)
+    ext = ext.lower()
+    if ext in DBF_BAD_UPLOAD_EXTS or ext not in DBF_EXTS:
+        return None, ('Yahan sirf data files upload hoti hain: ' + ', '.join(DBF_EXTS) +
+                      '. Script (.py / .js / .zip) ke liye Upload Script use karo.')
+    stem = re.sub(r'[^A-Za-z0-9._ -]+', '_', stem)
+    stem = re.sub(r'\.{2,}', '.', stem).strip(' ._-')[:60] or 'data'
+    name = (stem + ext)[:80]
+    if not _dbf_is_data_name(name):
+        return None, 'Ye config / helper file hai, data file nahi.'
+    return name, None
+
+
+def _dbf_check_content(name, data):
+    """None when the bytes look right for the extension, else a plain reason."""
+    ext = os.path.splitext(name)[1].lower()
+    if not data:
+        return 'File khali hai.'
+    if ext == '.json':
+        try:
+            json.loads(data.decode('utf-8-sig'))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return 'Ye valid JSON nahi hai, isliye nahi liya.'
+    elif ext in DBF_SQLITE_EXTS:
+        if not data.startswith(b'SQLite format 3\x00'):
+            return 'Ye asli SQLite database nahi lag raha, isliye nahi liya.'
+    return None
+
+
+def _dbf_write_atomic(full, data):
+    """Write to a temp file in the same folder, then swap it in. Never writes through a symlink."""
+    directory = os.path.dirname(full)
+    if os.path.islink(full) or os.path.islink(directory):
+        raise OSError('symlink')
+    tmp = os.path.join(directory, '.dbf_tmp_' + secrets.token_hex(6))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o644)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.path.islink(full):
+            raise OSError('symlink')
+        os.replace(tmp, full)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _dbf_pre_block(text, budget):
+    """A <pre> block whose ESCAPED text fits in `budget` characters."""
+    text = str(text)
+    while len(html_escape(text)) > budget and text:
+        text = text[:max(0, int(len(text) * 0.8) - 1)]
+    return f"<pre>{html_escape(text)}</pre>"
+
+
+def _dbf_back_row(markup, owner, script):
+    markup.row(NavButton("🔙 Back", callback_data=f'dbf_o_{owner}_{script}'))
+
+
+def _dbf_deny(call, text):
+    try:
+        bot.answer_callback_query(call.id, text, show_alert=True)
+    except Exception:
+        pass
+
+
+def _dbf_guard(call, owner, script, write=False):
+    """The context of this bot, or None after telling the person why not. Checked on EVERY action."""
+    uid = call.from_user.id
+    if getattr(call.message.chat, 'type', 'private') != 'private':
+        _dbf_deny(call, "🔒 Data files sirf private chat me khulte hain.")
+        return None
+    if is_user_banned(uid):
+        _dbf_deny(call, "❌ You are banned from using this bot.")
+        return None
+    if uid != owner:
+        _dbf_deny(call, "⚠️ Sirf apne bots ke data files dekh sakte ho.")
+        return None
+    if script not in _dbf_script_names(owner):
+        _dbf_deny(call, "⚠️ File not found.")
+        return None
+    if bot_locked and uid not in admin_ids:
+        _dbf_deny(call, "⚠️ Bot locked by admin.")
+        return None
+    if write and is_user_suspended(uid) and uid not in admin_ids:
+        _dbf_deny(call, "⏸️ Tumhari hosting suspend hai, abhi data files badal nahi sakte.")
+        return None
+    return _dbf_ctx(owner, script)
+
+
+def _dbf_when(ts):
+    return f"{ui_ago(ts)} · {datetime.fromtimestamp(ts).strftime('%d %b %Y, %H:%M')}"
+
+
+def _dbf_show_list(call, ctx, note=None, reset=False):
+    owner, script = ctx['owner'], ctx['script']
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    key = 'dbf' + _env_key_tag(f'{owner}/{script}')
+    if reset:
+        with PAGER_LOCK:
+            (PAGER.get(chat_id) or {}).pop(key, None)
+    files, truncated = _dbf_collect(ctx)
+    shown, page, pages = _paginate(chat_id, key, files)
+    markup = NavMenu(row_width=1)
+    markup.offset = page * NAV_PAGE_SIZE
+    lines = []
+    now = time.time()
+    for i, ent in enumerate(shown, start=page * NAV_PAGE_SIZE + 1):
+        tok = _dbf_token_new(uid, owner, script, kind='file', rel=ent['rel'])
+        label = f"{i}. {_dbf_icon(ent['name'])} {ent['name']} · {ui_size(ent['size'])}"
+        markup.add(NavButton(label, callback_data=f'dbf_f_{tok}_0_{script}'))
+        where = '' if '/' not in ent['rel'] else f"  📁 {ent['rel'].rsplit('/', 1)[0]}"
+        lines.append(f"{i}. {_dbf_icon(ent['name'])} <b>{html_escape(ent['name'])}</b> · {ui_size(ent['size'])} · {ui_ago(ent['mtime'], now)}{html_escape(where)}")
+    markup.pager(key, f'dbf_o_{owner}_{script}', page, pages)
+    markup.row(NavButton("⬆️ Upload Data File", callback_data=f'dbf_u_{owner}_{script}'))
+    markup.row(NavButton("🔙 Back to Controls", callback_data=f'dbf_b_{owner}_{script}'))
+    head = [ui_row('🤖', 'Bot', script, code=True)]
+    if files:
+        head.append(ui_row('📦', 'Data files', f"{len(files)}{'+' if truncated else ''}"))
+        body = ["", *lines]
+        foot = ('Sirf is bot ke data files. Doosre bot ka data uske apne panel me milega.' + _page_note(page, pages))
+    else:
+        body = ["", "📭 Is bot ke data files nahi mile.",
+                ui_note("Maine bot ke naam wale folder / files, code me likhe file names aur GitHub files dekhe. "
+                        "Naya data file bhejna ho to Upload Data File dabao.")]
+        foot = 'Sirf is bot ke data files dikhte hain.'
+    if note:
+        body = [note] + body
+    text = ui_msg('🗄️', 'Data Files', *head, *body, foot=foot)
+    _edit_or_send(call, text, markup)
+
+
+def _dbf_show_card(call, ctx, ent, note=None):
+    owner, script = ctx['owner'], ctx['script']
+    uid = call.from_user.id
+    rel = ent['rel']
+    full, err = _dbf_resolve(ctx, rel)
+    if err:
+        bot.answer_callback_query(call.id, "⚠️ Ye file ab nahi mili.", show_alert=True)
+        _dbf_show_list(call, ctx)
+        return
+    st = os.lstat(full)
+    name = rel.rsplit('/', 1)[-1]
+    tok = call.data.split('_')[2] if call.data.startswith('dbf_f_') else None
+    if tok is None or _dbf_token_get(tok, uid, owner, script) is not ent:
+        tok = _dbf_token_new(uid, owner, script, kind='file', rel=rel)
+    running = is_bot_running(owner, script)
+    lines = [ui_row('🤖', 'Bot', script, code=True), ui_row('📄', 'Name', name, code=True), ui_row('📁', 'Path', rel, code=True),
+             ui_row('📦', 'Size', ui_size(st.st_size)), ui_row('🕒', 'Modified', _dbf_when(st.st_mtime)),
+             ui_row('🧩', 'Type', os.path.splitext(name)[1][1:].upper())]
+    if running:
+        lines.append(ui_note("Bot chal raha hai: file badalne ya hatane ke baad restart karna padega."))
+    if note:
+        lines.insert(0, note)
+    markup = NavMenu(row_width=2)
+    markup.row(NavButton("⬇️ Download", callback_data=f'dbf_d_{tok}_0_{script}'),
+               NavButton("👁 Preview", callback_data=f'dbf_p_{tok}_0_{script}'))
+    markup.row(NavButton("🗑 Delete", callback_data=f'dbf_x_{tok}_0_{script}'),
+               NavButton("⬆️ Replace", callback_data=f'dbf_r_{tok}_0_{script}'))
+    _dbf_back_row(markup, owner, script)
+    _edit_or_send(call, ui_msg('🗄️', 'Data File', *lines, foot='Download, preview, delete ya replace — sirf isi bot ki file.'), markup)
+
+
+def _dbf_sqlite_open(full):
+    from urllib.parse import quote
+    conn = sqlite3.connect('file:' + quote(full) + '?mode=ro', uri=True, timeout=1.0)
+    deadline = time.monotonic() + 2.5
+    conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 2000)
+    allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}
+
+    def auth(action, *_a):
+        return sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
+    conn.set_authorizer(auth)
+    conn.text_factory = lambda b: b.decode('utf-8', 'replace')
+    return conn
+
+
+def _dbf_cell(value):
+    if value is None:
+        return 'NULL'
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<blob {len(value)} bytes>"
+    text = str(value).replace('\n', ' ').replace('\r', ' ')
+    return text if len(text) <= 40 else text[:37] + '...'
+
+
+def _dbf_preview_sqlite(full, table=None):
+    """(text for a <pre>, [table names]) or raises ValueError(plain reason). Read-only, bounded, no user SQL."""
+    try:
+        with open(full, 'rb') as handle:
+            if handle.read(16) != b'SQLite format 3\x00':
+                raise ValueError('Ye asli SQLite database nahi lag raha (header galat).')
+    except OSError:
+        raise ValueError('File padh nahi paya.')
+    try:
+        conn = _dbf_sqlite_open(full)
+    except sqlite3.Error:
+        raise ValueError('Database khul nahi raha (locked ya kharab ho sakta hai).')
+    try:
+        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+                                            "ORDER BY name LIMIT 60")]
+        if table is None:
+            out = []
+            for n in names[:30]:
+                qn = '"' + n.replace('"', '""') + '"'
+                try:
+                    count = conn.execute(f"SELECT COUNT(*) FROM {qn}").fetchone()[0]
+                except sqlite3.Error:
+                    count = '?'
+                out.append(f"{n}: {count} rows")
+            return ('\n'.join(out) if out else '(koi table nahi)'), names
+        if table not in names:
+            raise ValueError('Ye table ab nahi mila.')
+        qn = '"' + table.replace('"', '""') + '"'
+        cur = conn.execute(f"SELECT * FROM {qn} LIMIT 5")
+        cols = [d[0] for d in (cur.description or [])]
+        out = [' | '.join(cols[:12])]
+        for row in cur.fetchall():
+            out.append(' | '.join(_dbf_cell(v) for v in row[:12]))
+        return '\n'.join(out), names
+    except sqlite3.Error:
+        raise ValueError('Database padh nahi paya (locked ya kharab ho sakta hai).')
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _dbf_preview_text(full, ext):
+    """(text, note) for json / csv / jsonl / dat. Nothing is ever executed or unpickled."""
+    try:
+        size = os.path.getsize(full)
+        with open(full, 'rb') as handle:
+            raw = handle.read(262144 if ext == '.json' else 8192)
+    except OSError:
+        raise ValueError('File padh nahi paya.')
+    if b'\x00' in raw[:2048]:
+        raise ValueError('Ye binary file hai, text preview nahi ho sakta. Download kar lo.')
+    text = raw.decode('utf-8-sig', 'replace')
+    if ext == '.json':
+        if size <= len(raw):
+            try:
+                return json.dumps(json.loads(text), indent=2, ensure_ascii=False)[:3500], None
+            except (ValueError, RecursionError):
+                return text[:3500], 'Ye valid JSON nahi lag raha, kachcha text dikha raha hoon.'
+        return text[:3500], 'File bada hai, sirf shuru ka hissa dikha raha hoon.'
+    lines = text.splitlines()[:15]
+    return '\n'.join(lines)[:3500], ('Sirf shuru ki lines.' if size > len(raw) or len(text.splitlines()) > 15 else None)
+
+
+def _dbf_preview(call, ctx, ent, table_idx=None):
+    owner, script = ctx['owner'], ctx['script']
+    uid = call.from_user.id
+    rel = ent['rel']
+    full, err = _dbf_resolve(ctx, rel)
+    if err:
+        bot.answer_callback_query(call.id, "⚠️ Ye file ab nahi mili.", show_alert=True)
+        _dbf_show_list(call, ctx)
+        return
+    name = rel.rsplit('/', 1)[-1]
+    ext = os.path.splitext(name)[1].lower()
+    tok = call.data.split('_')[2]
+    markup = NavMenu(row_width=1)
+    note, shown_table = None, None
+    try:
+        if ext in DBF_SQLITE_EXTS:
+            table = None
+            if table_idx is not None:
+                tables = ent.get('tables') or []
+                table = tables[table_idx] if 0 <= table_idx < len(tables) else None
+            body, names = _dbf_preview_sqlite(full, table)
+            ent['tables'] = names[:16]
+            for i, n in enumerate(names[:16]):
+                markup.add(NavButton(f"🗂 {n}", callback_data=f'dbf_t_{tok}_{i}_{script}'))
+            shown_table = table
+        elif ext in ('.pkl', '.pickle'):
+            body, note = None, "Pickle file ko main kholta nahi (safety). Download karke apne paas dekh sakte ho."
+        else:
+            body, note = _dbf_preview_text(full, ext)
+    except ValueError as exc:
+        body, note = None, str(exc)
+    head = [ui_row('🤖', 'Bot', script, code=True), ui_row('📄', 'File', name, code=True)]
+    if shown_table:
+        head.append(ui_row('🗂', 'Table', shown_table, code=True))
+    if ext in DBF_SQLITE_EXTS and body is not None and not shown_table:
+        head.append(ui_note("Table dabao: uski pehli 5 rows dikhengi."))
+    used = len("\n".join(head)) + 400
+    parts = list(head)
+    if note:
+        parts.append(ui_note(note))
+    if body is not None:
+        parts.append(_dbf_pre_block(body, max(300, 3500 - used)))
+    markup.row(NavButton("🔙 Back to File", callback_data=f'dbf_f_{tok}_0_{script}'))
+    _edit_or_send(call, ui_msg('👁', 'Preview', *parts, foot='Sirf padhne ke liye. Kuch badla nahi.'), markup)
+
+
+def _dbf_download(call, ctx, ent):
+    owner, script = ctx['owner'], ctx['script']
+    full, err = _dbf_resolve(ctx, ent['rel'])
+    if err:
+        bot.answer_callback_query(call.id, "⚠️ Ye file ab nahi mili.", show_alert=True)
+        _dbf_show_list(call, ctx)
+        return
+    try:
+        pre = os.lstat(full)
+        if pre.st_size > DBF_DOWNLOAD_MAX:
+            bot.answer_callback_query(call.id, "📦 Ye file 50 MB se badi hai.", show_alert=True)
+            _edit_or_send(call, ui_warn('File Too Big', ui_row('📦', 'Size', ui_size(pre.st_size)),
+                                        "Telegram bot sirf 50 MB tak ki file bhej sakta hai, isliye ye download nahi ho sakti.",
+                                        foot='Chhota hissa chahiye to apne bot se export karwao.'),
+                          _dbf_card_back(ent, call, owner, script))
+            return
+        with open(full, 'rb') as handle:
+            now = os.fstat(handle.fileno())
+            if (now.st_ino, now.st_dev) != (pre.st_ino, pre.st_dev) or not _dbf_stat.S_ISREG(now.st_mode):
+                bot.answer_callback_query(call.id, "⚠️ File badal gayi, dobara try karo.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id, "⬇️ Bhej raha hoon...")
+            bot.send_document(call.message.chat.id, handle, visible_file_name=ent['rel'].rsplit('/', 1)[-1], caption=ui_note(f"{ent['rel']} · {ui_size(now.st_size)}"), parse_mode='HTML')
+        logger.info("Data file downloaded: user=%s bot=%s file=%s", call.from_user.id, script, ent['rel'])
+    except OSError:
+        bot.answer_callback_query(call.id, "⚠️ File padh nahi paya.", show_alert=True)
+    except Exception:
+        logger.exception("Data file download failed")
+        try:
+            bot.answer_callback_query(call.id, "⚠️ File bhej nahi paya.", show_alert=True)
+        except Exception:
+            pass
+
+
+def _dbf_card_back(ent, call, owner, script):
+    markup = NavMenu()
+    _dbf_back_row(markup, owner, script)
+    return markup
+
+
+def _dbf_delete_ask(call, ctx, ent, tok):
+    owner, script = ctx['owner'], ctx['script']
+    full, err = _dbf_resolve(ctx, ent['rel'])
+    if err:
+        bot.answer_callback_query(call.id, "⚠️ Ye file ab nahi mili.", show_alert=True)
+        _dbf_show_list(call, ctx)
+        return
+    bot.answer_callback_query(call.id)
+    lines = [ui_row('🤖', 'Bot', script, code=True), ui_row('📄', 'File', ent['rel'], code=True),
+             ui_row('📦', 'Size', ui_size(os.lstat(full).st_size))]
+    if is_bot_running(owner, script):
+        lines.append("⚠️ Bot abhi chal raha hai: file hatane se uska data ya kaam bigad sakta hai.")
+    lines.append("Ye wapas nahi aayegi.")
+    markup = NavMenu(row_width=2)
+    markup.row(NavButton("✅ Yes, delete", callback_data=f'dbf_xy_{tok}_0_{script}'),
+               NavButton("❌ No", callback_data=f'dbf_f_{tok}_0_{script}'))
+    _edit_or_send(call, ui_warn('Delete This File?', *lines), markup)
+
+
+def _dbf_delete_do(call, ctx, ent):
+    owner, script = ctx['owner'], ctx['script']
+    full, err = _dbf_resolve(ctx, ent['rel'])
+    if err:
+        bot.answer_callback_query(call.id, "Ye file pehle hi hat chuki hai.")
+        _dbf_show_list(call, ctx)
+        return
+    try:
+        os.remove(full)
+    except FileNotFoundError:
+        bot.answer_callback_query(call.id, "Ye file pehle hi hat chuki hai.")
+        _dbf_show_list(call, ctx)
+        return
+    except OSError:
+        bot.answer_callback_query(call.id, "⚠️ File hata nahi paya.", show_alert=True)
+        return
+    logger.info("Data file deleted: user=%s bot=%s file=%s", call.from_user.id, script, ent['rel'])
+    bot.answer_callback_query(call.id, "🗑 Delete ho gayi.")
+    note = ui_ok('Deleted', ui_row('📄', 'File', ent['rel'], code=True))
+    if is_bot_running(owner, script):
+        note += "\n" + ui_note("Bot chal raha hai: asar ke liye restart karo.")
+    _dbf_show_list(call, ctx, note=note)
+
+
+def _dbf_upload_prompt(call, ctx, mode, rel=None):
+    owner, script = ctx['owner'], ctx['script']
+    uid = call.from_user.id
+    bot.answer_callback_query(call.id)
+    bot.clear_step_handler_by_chat_id(call.message.chat.id)
+    try:
+        _discard_wait(uid)                 # a backup import that was waiting for its file is dropped
+    except Exception:
+        pass
+    with DBF_LOCK:
+        DBF_WAIT[uid] = {'owner': owner, 'script': script, 'mode': mode, 'rel': rel, 'time': time.time()}
+    what = (f"{ui_row('📄', 'Replace', rel, code=True)}\nNaya file bhejo (same type: <code>{html_escape(os.path.splitext(rel)[1])}</code>)."
+            if mode == 'replace' else "Data file bhejo (document ki tarah).")
+    text = ui_msg('⬆️', 'Upload Data File', ui_row('🤖', 'Bot', script, code=True), what,
+                  "Allowed: " + ", ".join(f"<code>{e}</code>" for e in DBF_EXTS) + " · max 20 MB",
+                  foot='Script (.py / .js / .zip) yahan nahi lete. 2 minute me cancel ho jayega.')
+    markup = NavMenu()
+    markup.row(NavButton("❌ Cancel Upload", callback_data=f'dbf_c_{owner}_{script}'))
+    _edit_or_send(call, text, markup)
+    with DBF_LOCK:                         # a document only counts while this screen is the last one shown
+        if uid in DBF_WAIT:
+            DBF_WAIT[uid]['seq'] = (_nav_get(call.message.chat.id) or {}).get('seq')
+
+
+def _dbf_restart_hint(owner, script):
+    return "Bot chal raha hai: naya data lene ke liye restart karo (main apne aap restart nahi karta)." if is_bot_running(owner, script) else None
+
+
+def _dbf_receive_upload(message, wait):
+    """The document that follows Upload Data File / Replace. Every check runs again here."""
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    _dbf_wait_drop(uid)
+    owner, script = wait['owner'], wait['script']
+
+    def fail(reason, again=True):
+        markup = NavMenu(row_width=1)
+        if again:
+            markup.row(NavButton("⬆️ Dobara try karo", callback_data=f'dbf_u_{owner}_{script}'))
+        markup.row(NavButton("🔙 Back", callback_data=f'dbf_o_{owner}_{script}'))
+        bot.send_message(chat_id, ui_warn('Upload Nahi Hua', html_escape(reason), foot='Kuch badla nahi.'), parse_mode='HTML', reply_markup=markup)
+
+    if uid != owner or getattr(message.chat, 'type', 'private') != 'private':
+        return fail('Ye yahan se nahi ho sakta.', False)
+    if is_user_banned(uid):
+        bot.reply_to(message, MSG_BANNED, parse_mode='HTML')
+        return
+    if bot_locked and uid not in admin_ids:
+        bot.reply_to(message, MSG_LOCKED, parse_mode='HTML')
+        return
+    if is_user_suspended(uid) and uid not in admin_ids:
+        return fail('Tumhari hosting suspend hai, abhi data files badal nahi sakte.', False)
+    if script not in _dbf_script_names(owner):
+        return fail('Ye bot ab nahi mila.', False)
+    doc = message.document
+    name, why = _dbf_clean_name(getattr(doc, 'file_name', None))
+    if why:
+        return fail(why)
+    mode, target_rel = wait.get('mode'), wait.get('rel')
+    ctx = _dbf_ctx(owner, script)
+    if mode == 'replace':
+        if os.path.splitext(name)[1].lower() != os.path.splitext(target_rel or '')[1].lower():
+            return fail('Replace me file ka type wahi hona chahiye jo purani file ka hai.')
+    if (doc.file_size or 0) > DBF_UPLOAD_MAX:
+        return fail('File 20 MB se badi hai.')
+    try:
+        info = bot.get_file(doc.file_id)
+        data = bot.download_file(info.file_path)
+    except Exception:
+        logger.exception("Data upload download failed")
+        return fail('File download nahi ho payi, dobara bhejo.')
+    if len(data) > DBF_UPLOAD_MAX:
+        return fail('File 20 MB se badi hai.')
+    reason = _dbf_check_content(target_rel.rsplit('/', 1)[-1] if mode == 'replace' else name, data)
+    if reason:
+        return fail(reason)
+    existing = False
+    if mode == 'replace':
+        full, err = _dbf_resolve(ctx, target_rel)
+        if err:
+            return fail('Jo file replace karni thi wo ab nahi mili.', False)
+        rel, existing = target_rel, True
+    else:
+        files, _t = _dbf_collect(ctx)
+        same = [e for e in files if e['name'].lower() == name.lower()]
+        if len(same) > 1:
+            return fail('Is naam ki ek se zyada files hain: jis file ko badalna hai usse khol kar Replace dabao.', False)
+        if same:
+            rel, existing = same[0]['rel'], True
+        else:
+            if len(files) >= DBF_MAX_FILES:
+                return fail(f'Is bot ke {DBF_MAX_FILES} data files pehle hi hain.', False)
+            rel = name if _dbf_why(ctx, name) else f"{os.path.splitext(script)[0]}_data/{name}"
+        full, err = _dbf_resolve(ctx, rel, must_exist=False)
+        if err:
+            return fail('Is naam se file yahan save nahi ho sakti.')
+    tok = _dbf_token_new(uid, owner, script, kind='write', rel=rel, data=data, existing=existing)
+    if not existing:
+        return _dbf_write_do(message, uid, owner, script, tok, chat_id)
+    old = os.lstat(full).st_size
+    markup = NavMenu(row_width=2)
+    markup.row(NavButton("✅ Yes, replace", callback_data=f'dbf_ry_{tok}_0_{script}'),
+               NavButton("❌ No", callback_data=f'dbf_rn_{tok}_0_{script}'))
+    lines = [ui_row('🤖', 'Bot', script, code=True), ui_row('📄', 'File', rel, code=True),
+             ui_row('📦', 'Purani', ui_size(old)), ui_row('📥', 'Nayi', ui_size(len(data)))]
+    if is_bot_running(owner, script):
+        lines.append("⚠️ Bot chal raha hai: replace ke baad restart karna padega.")
+    bot.send_message(chat_id, ui_warn('Replace This File?', *lines, foot='Purani file hat jayegi.'), parse_mode='HTML', reply_markup=markup)
+
+
+def _dbf_write_do(message_or_call, uid, owner, script, tok, chat_id):
+    """Write the checked bytes of a write token. Used after a new-file upload and after the replace confirm."""
+    ent = _dbf_token_get(tok, uid, owner, script)
+    if not ent or ent.get('kind') != 'write':
+        _safe_send(chat_id, ui_warn('Expired', 'Ye request purani ho gayi.', foot='Dobara Upload Data File dabao.'))
+        return
+    ctx = _dbf_ctx(owner, script)
+    full, err = _dbf_resolve(ctx, ent['rel'], must_exist=ent['existing'])
+    markup = NavMenu()
+    _dbf_back_row(markup, owner, script)
+    if err:
+        _safe_send(chat_id, ui_warn('Upload Nahi Hua', 'Is jagah file save nahi ho sakti.', foot='Kuch badla nahi.'), reply_markup=markup)
+        return
+    try:
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        if os.path.realpath(os.path.dirname(full)) != os.path.dirname(full):
+            raise OSError('path')
+        _dbf_write_atomic(full, ent['data'])
+    except OSError:
+        logger.warning("Data file write refused or failed: user=%s bot=%s", uid, script)
+        _safe_send(chat_id, ui_err('Save Nahi Hua', 'File save nahi ho payi.', foot='Kuch badla nahi.'), reply_markup=markup)
+        return
+    with DBF_LOCK:
+        DBF_TOKENS.pop(tok, None)
+    logger.info("Data file %s: user=%s bot=%s file=%s size=%s", 'replaced' if ent['existing'] else 'uploaded', uid, script, ent['rel'], len(ent['data']))
+    lines = [ui_row('🤖', 'Bot', script, code=True), ui_row('📄', 'File', ent['rel'], code=True), ui_row('📦', 'Size', ui_size(len(ent['data'])))]
+    hint = _dbf_restart_hint(owner, script)
+    if hint:
+        lines.append(ui_note(hint))
+    _safe_send(chat_id, ui_ok('Replaced' if ent['existing'] else 'Uploaded', *lines), reply_markup=markup)
+
+
+def dbf_callback(call):
+    """All buttons of the Data Files viewer (callback prefix dbf_). Opened only from a bot's own control panel."""
+    try:
+        data = call.data
+        try:
+            _, act, rest = data.split('_', 2)
+        except ValueError:
+            raise ValueError('shape')
+        uid = call.from_user.id
+        if act in ('e', 'o', 'u', 'c', 'b'):
+            owner_str, script = rest.split('_', 1)
+            owner = int(owner_str)
+            ctx = _dbf_guard(call, owner, script, write=(act == 'u'))
+            if ctx is None:
+                return
+            bot.clear_step_handler_by_chat_id(call.message.chat.id)
+            if act == 'b':
+                _dbf_wait_drop(uid)
+                call.data = f'file_{owner}_{script}'
+                return file_control_callback(call)
+            if act == 'u':
+                return _dbf_upload_prompt(call, ctx, 'new')
+            if act == 'c':
+                _dbf_wait_drop(uid)
+                bot.answer_callback_query(call.id, "Cancel ho gaya.")
+                return _dbf_show_list(call, ctx)
+            _dbf_wait_drop(uid)
+            bot.answer_callback_query(call.id)
+            return _dbf_show_list(call, ctx, reset=(act == 'e'))
+        if act not in ('f', 'd', 'p', 't', 'x', 'xy', 'r', 'ry', 'rn'):
+            raise ValueError('act')
+        tok, idx_str, script = rest.split('_', 2)
+        idx = int(idx_str)
+        write = act in ('xy', 'r', 'ry')
+        ctx = _dbf_guard(call, uid, script, write=write or act == 'x')
+        if ctx is None:
+            return
+        ent = _dbf_token_get(tok, uid, uid, script)
+        if ent is None or (ent.get('kind') != ('write' if act in ('ry', 'rn') else 'file')):
+            bot.answer_callback_query(call.id, "⌛ Ye button purana ho gaya. Data Files dobara kholo.", show_alert=True)
+            return
+        bot.clear_step_handler_by_chat_id(call.message.chat.id)
+        _dbf_wait_drop(uid)
+        if act == 'f':
+            bot.answer_callback_query(call.id)
+            return _dbf_show_card(call, ctx, ent)
+        if act == 'd':
+            return _dbf_download(call, ctx, ent)
+        if act == 'p':
+            bot.answer_callback_query(call.id)
+            return _dbf_preview(call, ctx, ent)
+        if act == 't':
+            bot.answer_callback_query(call.id)
+            return _dbf_preview(call, ctx, ent, table_idx=idx)
+        if act == 'x':
+            return _dbf_delete_ask(call, ctx, ent, tok)
+        if act == 'xy':
+            return _dbf_delete_do(call, ctx, ent)
+        if act == 'r':
+            full, err = _dbf_resolve(ctx, ent['rel'])
+            if err:
+                bot.answer_callback_query(call.id, "⚠️ Ye file ab nahi mili.", show_alert=True)
+                return _dbf_show_list(call, ctx)
+            return _dbf_upload_prompt(call, ctx, 'replace', ent['rel'])
+        if act == 'rn':
+            with DBF_LOCK:
+                DBF_TOKENS.pop(tok, None)
+            bot.answer_callback_query(call.id, "Kuch badla nahi.")
+            return _dbf_show_list(call, ctx, note=ui_note("Replace cancel: purani file waisi hi hai."))
+        if act == 'ry':
+            bot.answer_callback_query(call.id)
+            return _dbf_write_do(call, uid, uid, script, tok, call.message.chat.id)
+    except (ValueError, IndexError):
+        try:
+            bot.answer_callback_query(call.id, "Error: Invalid action data.", show_alert=True)
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.error("Error in dbf_callback for '%s': %s", call.data, redact_secrets(exc), exc_info=True)
+        try:
+            bot.answer_callback_query(call.id, "An error occurred.", show_alert=True)
+        except Exception:
+            pass
 
 
 def file_control_callback(call):
@@ -9717,7 +10833,11 @@ def logs_bot_callback(call):
             bot.send_message(chat_id_for_reply,
                              ui_msg('📜', 'Script Logs', ui_row('📄', 'File', file_name, code=True),
                                     ui_row('👤', 'Owner', script_owner_id, code=True),
-                                    f"<pre>{html_escape(log_content)}</pre>"), parse_mode='HTML')
+                                    f"📡 Status: {ui_tag('active') if is_bot_running(script_owner_id, file_name) else ui_tag('stopped')}",
+                                    ui_row('🕒', 'Last write', ui_ago(os.path.getmtime(log_path))),
+                                    "👇 Tap to open the latest lines:",
+                                    ui_expand(log_content, 2800),
+                                    foot='Logs show what your script printed.'), parse_mode='HTML')
         except Exception as e:
             logger.error(f"Error reading/sending log {log_path}: {e}", exc_info=True)
             bot.send_message(chat_id_for_reply, ui_err('Logs Unavailable', ui_row('📄', 'File', file_name, code=True),
@@ -9885,7 +11005,7 @@ def _env_receive_input(message, owner_id, file_name, expected_uid):
             return
         if is_user_banned(uid) or not (uid == owner_id or uid in admin_ids) \
                 or not any(item[0] == file_name for item in user_files.get(owner_id, [])):
-            bot.send_message(chat_id, "⚠️ That bot is not available for you any more. Nothing was changed.")
+            bot.send_message(chat_id, ui_warn('Not Available', 'That bot is not available for you any more.', foot='Nothing was changed.'), parse_mode='HTML')
             return
         if message.content_type == 'document':
             doc = message.document
@@ -9894,18 +11014,18 @@ def _env_receive_input(message, owner_id, file_name, expected_uid):
                 return
             raw = bot.download_file(bot.get_file(doc.file_id).file_path)
             if len(raw) > ENV_MAX_FILE_BYTES:
-                bot.send_message(chat_id, "❌ That file is too big for an environment file. Nothing was changed.")
+                bot.send_message(chat_id, ui_err('File Too Big', 'That file is too big for an environment file.', foot='Nothing was changed.'), parse_mode='HTML')
                 return
             try:
                 text = raw.decode('utf-8-sig')
             except UnicodeDecodeError:
-                bot.send_message(chat_id, "❌ I could not read that file as text. Send a plain text .env file. Nothing was changed.")
+                bot.send_message(chat_id, ui_err('Could Not Read', 'I could not read that file as text. Send a plain text .env file.', foot='Nothing was changed.'), parse_mode='HTML')
                 return
         elif text is None:
-            bot.send_message(chat_id, "❌ Please send text like KEY=VALUE, or a .env file. Nothing was changed.")
+            bot.send_message(chat_id, ui_err('Text Needed', 'Please send text like KEY=VALUE, or a .env file.', foot='Nothing was changed.'), parse_mode='HTML')
             return
         if len(text) > ENV_MAX_FILE_BYTES:
-            bot.send_message(chat_id, "❌ That is too much text. Nothing was changed.")
+            bot.send_message(chat_id, ui_err('Too Much Text', 'That is too much text.', foot='Nothing was changed.'), parse_mode='HTML')
             return
 
         pairs, problems = parse_env_text(text)
@@ -9944,7 +11064,7 @@ def _env_receive_input(message, owner_id, file_name, expected_uid):
     except Exception as exc:
         logger.error("Error saving environment for %s: %s", file_name, redact_secrets(exc), exc_info=True)
         try:
-            bot.send_message(chat_id, "⚠️ Something went wrong while saving. Please try again.")
+            bot.send_message(chat_id, ui_warn('Something Went Wrong', 'Something went wrong while saving.', foot='Please try again.'), parse_mode='HTML')
         except Exception:
             pass
 
@@ -10085,11 +11205,11 @@ BROADCAST_PENDING_MAX = 20
 def process_broadcast_message(message):
     user_id = message.from_user.id
     if user_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
-    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, "Broadcast cancelled."); return
+    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, ui_info('Cancelled', 'Broadcast cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML'); return
 
     broadcast_content = message.text # Can also handle photos, videos etc. if message.content_type is checked
     if not broadcast_content and not (message.photo or message.video or message.document or message.sticker or message.voice or message.audio): # If no text and no other media
-         bot.reply_to(message, "⚠️ Cannot broadcast empty message. Send text or media, or /cancel.")
+         bot.reply_to(message, ui_warn('Not Allowed', 'Cannot broadcast empty message.', foot='Send text or media, or /cancel.'), parse_mode='HTML')
          msg = bot.send_message(message.chat.id, "📢 Send broadcast message or /cancel.")
          bot.register_next_step_handler(msg, process_broadcast_message)
          return
@@ -10105,8 +11225,9 @@ def process_broadcast_message(message):
     preview_text = broadcast_content[:1000].strip().replace('`' * 3, "'" * 3) if broadcast_content else "(Media message)"
     bot.reply_to(message, ui_msg('📢', 'Confirm Broadcast',
                                  ui_row('👥', 'Target users', ui_num(target_count)),
-                                 '',
-                                 f"<pre>{html_escape(preview_text)}</pre>",
+                                 f"📡 Status: {ui_tag('warn', 'WAITING FOR CONFIRM')}",
+                                 ui_section('👁️', 'Preview'),
+                                 ui_expand(preview_text, 900, tail=False),
                                  foot='Tap Confirm & Send to go ahead, or Cancel.'),
                  reply_markup=markup, parse_mode='HTML')
 
@@ -10173,7 +11294,7 @@ def handle_confirm_broadcast(call):
         bot.edit_message_text(ui_err('Broadcast Not Started', 'The message to send could not be found. Please start the broadcast again.'), chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
     except Exception as e:
         logger.error(f"Error in handle_confirm_broadcast: {e}", exc_info=True)
-        bot.edit_message_text("❌ Unexpected error during broadcast confirm.", chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
+        bot.edit_message_text(ui_err('Broadcast Not Sent', 'An unexpected error stopped the broadcast.', foot='Nothing was sent. Please try again.'), chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id), parse_mode='HTML')
 
 def handle_cancel_broadcast(call):
     bot.answer_callback_query(call.id, "Broadcast cancelled.")
@@ -10258,12 +11379,14 @@ def execute_broadcast(broadcast_text, photo_id, video_id, caption, admin_chat_id
     logger.info("Broadcast complete | sent %s | failed %s | blocked %s | targets %s | %ss",
                 sent_count, failed_count, blocked_count, total_users, duration)
     result_msg = ui_ok('Broadcast Complete',
+                       f"📡 Status: {ui_tag('ok', 'DELIVERED') if sent_count and not failed_count else ui_tag('warn', 'PARTIAL' if sent_count else 'NOT DELIVERED')}",
                        ui_row('✅', 'Sent', sent_count),
                        ui_row('❌', 'Failed', failed_count),
                        ui_row('🚫', 'Blocked / inactive', blocked_count),
                        ui_row('👥', 'Targets', total_users),
                        f"<code>{ui_bar(sent_count, total_users)}</code> delivered",
                        ui_row('⏱️', 'Duration', f'{duration}s'),
+                       foot='Failed or blocked users are skipped, nothing to redo.' if (failed_count or blocked_count) else 'Everyone active got your message.',
                        progress=(sent_count / total_users) if total_users else None)
     try:
         menu = None
@@ -10295,52 +11418,52 @@ def _adm_show(call, text, kb):
 
 def add_admin_init_callback(call):
     bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "👑 Enter User ID to promote to Admin.\n/cancel to abort.")
+    msg = bot.send_message(call.message.chat.id, ui_msg('👑', 'Add Admin', 'Send the numeric user ID to promote.', foot='Send /cancel to abort.'), parse_mode='HTML')
     bot.register_next_step_handler(msg, process_add_admin_id)
 
 def process_add_admin_id(message):
     owner_id_check = message.from_user.id 
-    if owner_id_check != OWNER_ID: bot.reply_to(message, "⚠️ Owner only."); return
-    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, "Admin promotion cancelled."); return
+    if owner_id_check != OWNER_ID: bot.reply_to(message, ui_warn('Owner Only', 'Only the owner can do this.', foot='Ask the owner if you need it.'), parse_mode='HTML'); return
+    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, ui_info('Cancelled', 'Admin promotion cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML'); return
     try:
         new_admin_id = int(message.text.strip())
         if new_admin_id <= 0 or new_admin_id >= 2 ** 63: raise ValueError("ID must be positive")
-        if new_admin_id == OWNER_ID: bot.reply_to(message, "⚠️ Owner is already Owner."); return
-        if new_admin_id in admin_ids: bot.reply_to(message, f"⚠️ User `{new_admin_id}` already Admin."); return
+        if new_admin_id == OWNER_ID: bot.reply_to(message, ui_warn('Already Done', 'That user is already the Owner.', foot='Nothing to change.'), parse_mode='HTML'); return
+        if new_admin_id in admin_ids: bot.reply_to(message, ui_warn('Already Admin', ui_row('👤', 'User', new_admin_id, code=True), f"🛡️ Role: {ui_tag('admin')}", foot='Nothing to change.'), parse_mode='HTML'); return
         add_admin_db(new_admin_id, owner_id_check) 
         logger.warning(f"Admin {new_admin_id} added by Owner {owner_id_check}.")
-        bot.reply_to(message, f"✅ User `{new_admin_id}` promoted to Admin.")
-        try: bot.send_message(new_admin_id, "🎉 Congrats! You are now an Admin.")
+        bot.reply_to(message, ui_ok('Admin Added', ui_row('👤', 'User', new_admin_id, code=True), f"🛡️ Role: {ui_tag('admin')}", foot='The user has been told about it.'), parse_mode='HTML')
+        try: bot.send_message(new_admin_id, ui_ok('You Are Now An Admin', f"🛡️ Role: {ui_tag('admin')}", foot='Open the Admin Panel from the menu.'), parse_mode='HTML')
         except Exception as e: logger.error(f"Failed to notify new admin {new_admin_id}: {e}")
     except ValueError:
         bot.reply_to(message, ui_warn('Invalid User ID', 'Send a numeric user ID.', foot='or send /cancel'), parse_mode='HTML')
-        msg = bot.send_message(message.chat.id, "👑 Enter User ID to promote or /cancel.")
+        msg = bot.send_message(message.chat.id, ui_msg('👑', 'Add Admin', 'Send the numeric user ID to promote.', foot='Or send /cancel.'), parse_mode='HTML')
         bot.register_next_step_handler(msg, process_add_admin_id)
     except Exception as e: logger.error(f"Error processing add admin: {e}", exc_info=True); bot.reply_to(message, ui_err('Something Went Wrong', 'That did not work. Nothing was changed, please try again.'), parse_mode='HTML')
 
 def remove_admin_init_callback(call):
     bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "👑 Enter User ID of Admin to remove.\n/cancel to abort.")
+    msg = bot.send_message(call.message.chat.id, ui_msg('👑', 'Remove Admin', 'Send the numeric user ID of the admin to remove.', foot='Send /cancel to abort.'), parse_mode='HTML')
     bot.register_next_step_handler(msg, process_remove_admin_id)
 
 def process_remove_admin_id(message):
     owner_id_check = message.from_user.id
-    if owner_id_check != OWNER_ID: bot.reply_to(message, "⚠️ Owner only."); return
-    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, "Admin removal cancelled."); return
+    if owner_id_check != OWNER_ID: bot.reply_to(message, ui_warn('Owner Only', 'Only the owner can do this.', foot='Ask the owner if you need it.'), parse_mode='HTML'); return
+    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, ui_info('Cancelled', 'Admin removal cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML'); return
     try:
         admin_id_remove = int(message.text.strip()) # Renamed
         if admin_id_remove <= 0: raise ValueError("ID must be positive")
-        if admin_id_remove == OWNER_ID: bot.reply_to(message, "⚠️ Owner cannot remove self."); return
-        if admin_id_remove not in admin_ids: bot.reply_to(message, f"⚠️ User `{admin_id_remove}` not Admin."); return
+        if admin_id_remove == OWNER_ID: bot.reply_to(message, ui_warn('Not Allowed', 'The owner cannot remove themselves.', foot='Pick a different admin.'), parse_mode='HTML'); return
+        if admin_id_remove not in admin_ids: bot.reply_to(message, ui_warn('Not An Admin', ui_row('👤', 'User', admin_id_remove, code=True), foot='Nothing to remove.'), parse_mode='HTML'); return
         if remove_admin_db(admin_id_remove): 
             logger.warning(f"Admin {admin_id_remove} removed by Owner {owner_id_check}.")
-            bot.reply_to(message, f"✅ Admin `{admin_id_remove}` removed.")
-            try: bot.send_message(admin_id_remove, "ℹ️ You are no longer an Admin.")
+            bot.reply_to(message, ui_ok('Admin Removed', ui_row('👤', 'User', admin_id_remove, code=True), f"🛡️ Role: {ui_tag('free', 'USER')}", foot='The user has been told about it.'), parse_mode='HTML')
+            try: bot.send_message(admin_id_remove, ui_info('Admin Role Ended', f"🛡️ Role: {ui_tag('free', 'USER')}", foot='You can still use the bot as a normal user.'), parse_mode='HTML')
             except Exception as e: logger.error(f"Failed to notify removed admin {admin_id_remove}: {e}")
-        else: bot.reply_to(message, f"❌ Failed to remove admin `{admin_id_remove}`. Check logs.")
+        else: bot.reply_to(message, ui_err('Action Failed', ui_row('👤', 'User', admin_id_remove, code=True), 'Failed to remove this admin. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
     except ValueError:
         bot.reply_to(message, ui_warn('Invalid User ID', 'Send a numeric user ID.', foot='or send /cancel'), parse_mode='HTML')
-        msg = bot.send_message(message.chat.id, "👑 Enter Admin ID to remove or /cancel.")
+        msg = bot.send_message(message.chat.id, ui_msg('👑', 'Remove Admin', 'Send the numeric ID of the admin to remove.', foot='Or send /cancel.'), parse_mode='HTML')
         bot.register_next_step_handler(msg, process_remove_admin_id)
     except Exception as e: logger.error(f"Error processing remove admin: {e}", exc_info=True); bot.reply_to(message, ui_err('Something Went Wrong', 'That did not work. Nothing was changed, please try again.'), parse_mode='HTML')
 
@@ -10365,7 +11488,7 @@ def add_subscription_init_callback(call):
 def process_add_subscription_details(message):
     admin_id_check = message.from_user.id 
     if admin_id_check not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
-    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, "Sub add cancelled."); return
+    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, ui_info('Cancelled', 'Sub add cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML'); return
     try:
         parts = message.text.split();
         if len(parts) != 2: raise ValueError("Incorrect format")
@@ -10379,8 +11502,8 @@ def process_add_subscription_details(message):
         save_subscription(sub_user_id, new_expiry)
 
         logger.info(f"Sub for {sub_user_id} by admin {admin_id_check}. Expiry: {new_expiry:%Y-%m-%d}")
-        bot.reply_to(message, ui_ok('Subscription Added', ui_row('👤', 'User', sub_user_id, code=True), ui_row('➕', 'Added', f'{days} days'), ui_row('📅', 'New expiry', f'{new_expiry:%Y-%m-%d}')), parse_mode='HTML')
-        try: bot.send_message(sub_user_id, ui_ok('Subscription Active', ui_row('➕', 'Added', f'{days} days'), ui_row('📅', 'Expires', f'{new_expiry:%Y-%m-%d}')), parse_mode='HTML')
+        bot.reply_to(message, ui_ok('Subscription Added', ui_row('👤', 'User', sub_user_id, code=True), f"⭐ Plan: {ui_tag('premium')}", ui_row('➕', 'Added', f'{days} days'), ui_row('📅', 'New expiry', f'{new_expiry:%Y-%m-%d}'), foot='The user has been told about it.'), parse_mode='HTML')
+        try: bot.send_message(sub_user_id, ui_ok('Premium Activated', f"⭐ Plan: {ui_tag('premium')}", ui_row('➕', 'Added', f'{days} days'), ui_row('📅', 'Expires', f'{new_expiry:%Y-%m-%d}'), ui_row('⏳', 'Days left', ui_num(max(0, (new_expiry - datetime.now()).days))), foot='Enjoy more slots. Open My Files to upload.'), parse_mode='HTML')
         except Exception as e: logger.error(f"Failed to notify {sub_user_id} of new sub: {e}")
     except ValueError as e:
         bot.reply_to(message, ui_warn('Invalid Input', 'Please send a user ID and a number of days.', ui_row('✍️', 'Format', 'ID days', code=True), foot='or send /cancel'), parse_mode='HTML')
@@ -10396,7 +11519,7 @@ def remove_subscription_init_callback(call):
 def process_remove_subscription_id(message):
     admin_id_check = message.from_user.id
     if admin_id_check not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
-    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, "Sub removal cancelled."); return
+    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, ui_info('Cancelled', 'Sub removal cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML'); return
     try:
         sub_user_id_remove = int(message.text.strip()) # Renamed
         if sub_user_id_remove <= 0: raise ValueError("ID must be positive")
@@ -10405,7 +11528,7 @@ def process_remove_subscription_id(message):
         remove_subscription_db(sub_user_id_remove) 
         logger.warning(f"Sub removed for {sub_user_id_remove} by admin {admin_id_check}.")
         bot.reply_to(message, ui_ok('Subscription Removed', ui_row('👤', 'User', sub_user_id_remove, code=True)), parse_mode='HTML')
-        try: bot.send_message(sub_user_id_remove, ui_info('Subscription Removed', 'Your subscription was removed by the admin.'), parse_mode='HTML')
+        try: bot.send_message(sub_user_id_remove, ui_info('Premium Ended', f"⭐ Plan: {ui_tag('free')}", 'Your Premium was removed by an admin.', foot='Your files are safe. Contact the owner to renew.'), parse_mode='HTML')
         except Exception as e: logger.error(f"Failed to notify {sub_user_id_remove} of sub removal: {e}")
     except ValueError:
         bot.reply_to(message, ui_warn('Invalid User ID', 'Send a numeric user ID.', foot='or send /cancel'), parse_mode='HTML')
@@ -10421,7 +11544,7 @@ def check_subscription_init_callback(call):
 def process_check_subscription_id(message):
     admin_id_check = message.from_user.id
     if admin_id_check not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
-    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, "Sub check cancelled."); return
+    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, ui_info('Cancelled', 'Sub check cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML'); return
     try:
         sub_user_id_check = int(message.text.strip()) # Renamed
         if sub_user_id_check <= 0: raise ValueError("ID must be positive")
@@ -10430,9 +11553,9 @@ def process_check_subscription_id(message):
             if expiry_dt:
                 if expiry_dt > datetime.now():
                     days_left = (expiry_dt - datetime.now()).days
-                    bot.reply_to(message, ui_ok('Active Subscription', ui_row('👤', 'User', sub_user_id_check, code=True), ui_row('📅', 'Expires', f'{expiry_dt:%Y-%m-%d %H:%M}'), ui_row('⏳', 'Days left', ui_num(days_left))), parse_mode='HTML')
+                    bot.reply_to(message, ui_ok('Active Subscription', ui_row('👤', 'User', sub_user_id_check, code=True), f"⭐ Plan: {ui_tag('premium')}", ui_row('📅', 'Expires', f'{expiry_dt:%Y-%m-%d %H:%M}'), ui_row('⏳', 'Days left', ui_num(days_left))), parse_mode='HTML')
                 else:
-                    bot.reply_to(message, ui_warn('Subscription Expired', ui_row('👤', 'User', sub_user_id_check, code=True), ui_row('📅', 'Expired on', f'{expiry_dt:%Y-%m-%d %H:%M}')), parse_mode='HTML')
+                    bot.reply_to(message, ui_warn('Subscription Expired', ui_row('👤', 'User', sub_user_id_check, code=True), f"⌛ Plan: {ui_tag('expired')}", ui_row('📅', 'Expired on', f'{expiry_dt:%Y-%m-%d %H:%M}')), parse_mode='HTML')
                     remove_subscription_db(sub_user_id_check) # Clean up
             else: bot.reply_to(message, ui_warn('Expiry Missing', ui_row('👤', 'User', sub_user_id_check, code=True), 'In the subscription list, but no expiry date. Re-add if needed.'), parse_mode='HTML')
         else: bot.reply_to(message, ui_info('No Subscription', ui_row('👤', 'User', sub_user_id_check, code=True), 'No active subscription record.'), parse_mode='HTML')
@@ -10452,7 +11575,7 @@ def user_management_callback(call):
 
 def ban_user_callback(call):
     bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "🚫 Enter User ID to ban and reason (e.g., `12345678 Spamming`)\n/cancel to cancel")
+    msg = bot.send_message(call.message.chat.id, ui_msg('🚫', 'Ban User', 'Send the user ID and a reason.', 'Example: <code>12345678 Spamming</code>', foot='Send /cancel to cancel.'), parse_mode='HTML')
     bot.register_next_step_handler(msg, process_ban_user)
 
 def process_ban_user(message):
@@ -10460,7 +11583,7 @@ def process_ban_user(message):
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Ban cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Ban cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     
     try:
@@ -10473,8 +11596,8 @@ def process_ban_user(message):
         reason = ' '.join(parts[1:])
         
         if user_id <= 0: raise ValueError("ID must be positive")
-        if user_id == OWNER_ID: bot.reply_to(message, "⚠️ Cannot ban owner."); return
-        if user_id in admin_ids: bot.reply_to(message, "⚠️ Cannot ban admin."); return
+        if user_id == OWNER_ID: bot.reply_to(message, ui_warn('Not Allowed', 'Cannot ban owner.', foot='Pick a different user.'), parse_mode='HTML'); return
+        if user_id in admin_ids: bot.reply_to(message, ui_warn('Not Allowed', 'Cannot ban admin.', foot='Pick a different user.'), parse_mode='HTML'); return
         
         if ban_user_db(user_id, reason, admin_id):
             bot.reply_to(message, ui_ok('User Banned', ui_row('👤', 'User', user_id, code=True), ui_row('📝', 'Reason', reason)), parse_mode='HTML')
@@ -10487,11 +11610,11 @@ def process_ban_user(message):
                     kill_process_tree(stopped_info)
             
             try:
-                bot.send_message(user_id, ui_err('Banned', 'You have been banned from using this bot.', ui_row('📝', 'Reason', reason)), parse_mode='HTML')
+                bot.send_message(user_id, ui_err('Account Banned', f"🚫 Status: {ui_tag('banned')}", 'You can no longer use this bot.', ui_row('📝', 'Reason', reason), foot='Think this is a mistake? Contact the owner.'), parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Failed to notify banned user {user_id}: {e}")
         else:
-            bot.reply_to(message, "❌ Failed to ban user.")
+            bot.reply_to(message, ui_err('Action Failed', 'Failed to ban user. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
             
     except ValueError:
         bot.reply_to(message, ui_warn('Invalid User ID', 'The user ID must be a number.'), parse_mode='HTML')
@@ -10501,7 +11624,7 @@ def process_ban_user(message):
 
 def unban_user_callback(call):
     bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "✅ Enter User ID to unban\n/cancel to cancel")
+    msg = bot.send_message(call.message.chat.id, ui_msg('✅', 'Unban User', 'Send the user ID to unban.', foot='Send /cancel to cancel.'), parse_mode='HTML')
     bot.register_next_step_handler(msg, process_unban_user)
 
 def process_unban_user(message):
@@ -10509,7 +11632,7 @@ def process_unban_user(message):
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Unban cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Unban cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     
     try:
@@ -10527,7 +11650,7 @@ def process_unban_user(message):
             except Exception as e:
                 logger.error(f"Failed to notify unbanned user {user_id}: {e}")
         else:
-            bot.reply_to(message, "❌ Failed to unban user.")
+            bot.reply_to(message, ui_err('Action Failed', 'Failed to unban user. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
             
     except ValueError:
         bot.reply_to(message, ui_warn('Invalid User ID', 'The user ID must be a number.'), parse_mode='HTML')
@@ -10545,7 +11668,7 @@ def process_user_info(message):
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Info request cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Info request cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     
     try:
@@ -10658,7 +11781,7 @@ def process_set_user_limit(message):
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Limit set cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Limit set cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     
     try:
@@ -10671,13 +11794,13 @@ def process_set_user_limit(message):
         if user_id <= 0 or limit <= 0: raise ValueError("ID and limit must be positive")
         
         if set_user_limit_db(user_id, limit, admin_id):
-            bot.reply_to(message, f"✅ Set file limit {limit} for user `{user_id}`")
+            bot.reply_to(message, ui_ok('File Limit Set', ui_row('👤', 'User', user_id, code=True), ui_row('📁', 'New limit', f'{limit} files'), foot='Applies right away.'), parse_mode='HTML')
             try:
                 bot.send_message(user_id, f"⚙️ Your file upload limit has been set to {limit}")
             except Exception as e:
                 logger.error(f"Failed to notify user {user_id}: {e}")
         else:
-            bot.reply_to(message, "❌ Failed to set limit.")
+            bot.reply_to(message, ui_err('Action Failed', 'Failed to set limit. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
             
     except ValueError as e:
         bot.reply_to(message, ui_warn('Invalid Input', 'Please send a user ID and a limit (numbers only).', ui_row('✍️', 'Format', 'user_id limit', code=True)), parse_mode='HTML')
@@ -10695,7 +11818,7 @@ def process_remove_user_limit(message):
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Limit removal cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Limit removal cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     
     try:
@@ -10703,17 +11826,17 @@ def process_remove_user_limit(message):
         if user_id <= 0: raise ValueError("ID must be positive")
         
         if user_id not in user_limits:
-            bot.reply_to(message, f"ℹ️ User `{user_id}` has no custom limit.")
+            bot.reply_to(message, ui_info('No Custom Limit', ui_row('👤', 'User', user_id, code=True), 'This user already uses the standard limit.', foot='Nothing to remove.'), parse_mode='HTML')
             return
         
         if remove_user_limit_db(user_id):
-            bot.reply_to(message, f"✅ Removed custom limit for user `{user_id}`")
+            bot.reply_to(message, ui_ok('Limit Removed', ui_row('👤', 'User', user_id, code=True), 'The standard file limit applies now.', foot='The user has been told about it.'), parse_mode='HTML')
             try:
-                bot.send_message(user_id, "⚙️ Your custom file limit has been removed")
+                bot.send_message(user_id, ui_info('File Limit Reset', 'Your custom file limit was removed.', foot='The standard limit applies now.'), parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Failed to notify user {user_id}: {e}")
         else:
-            bot.reply_to(message, "❌ Failed to remove limit.")
+            bot.reply_to(message, ui_err('Action Failed', 'Failed to remove limit. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
             
     except ValueError:
         bot.reply_to(message, ui_warn('Invalid User ID', 'The user ID must be a number.'), parse_mode='HTML')
@@ -10819,10 +11942,11 @@ def _um_do_ban(user_id, reason, admin_id, until=None, exclude_chat=None):
         logger.exception("Could not stop scripts of banned user %s", user_id)
     try:
         if until is not None:
-            bot.send_message(user_id, f"⏳ You have been temporarily banned until {until.strftime('%Y-%m-%d %H:%M')}.\n"
-                                      f"Reason: {reason}\nThe ban lifts automatically.")
+            bot.send_message(user_id, ui_err('Temporary Ban', f"🚫 Status: {ui_tag('banned', 'TEMP BAN')}",
+                                             ui_row('⏳', 'Lifts on', f"{until.strftime('%Y-%m-%d %H:%M')}"), ui_row('📝', 'Reason', reason),
+                                             foot='The ban lifts by itself, nothing for you to do.'), parse_mode='HTML')
         else:
-            bot.send_message(user_id, ui_err('Banned', 'You have been banned from using this bot.', ui_row('📝', 'Reason', reason)), parse_mode='HTML')
+            bot.send_message(user_id, ui_err('Account Banned', f"🚫 Status: {ui_tag('banned')}", 'You can no longer use this bot.', ui_row('📝', 'Reason', reason), foot='Think this is a mistake? Contact the owner.'), parse_mode='HTML')
     except Exception as e:
         logger.error(f"Failed to notify banned user {user_id}: {e}")
     return ''
@@ -10832,7 +11956,7 @@ def process_um_tempban(message):
     admin_id = message.from_user.id
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Temp ban cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Temp ban cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     try:
         parts = (message.text or '').split(None, 2)
@@ -10844,7 +11968,7 @@ def process_um_tempban(message):
         days = int(parts[1])
         if user_id <= 0: raise ValueError("ID must be positive")
         if not 1 <= days <= TEMP_BAN_MAX_DAYS:
-            bot.reply_to(message, f"⚠️ Days must be between 1 and {TEMP_BAN_MAX_DAYS}.")
+            bot.reply_to(message, ui_warn('Check The Days', f'Days must be between 1 and {TEMP_BAN_MAX_DAYS}.', foot='Send user_id days reason again, or /cancel.'), parse_mode='HTML')
             return
         reason = _um_clean_text(parts[2]) if len(parts) > 2 else ''
         reason = reason or 'Temporary ban by admin'
@@ -10864,7 +11988,7 @@ def process_um_tempban(message):
                      parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error in temp ban: {e}", exc_info=True)
-        bot.reply_to(message, "❌ Something went wrong while banning. Check the logs.")
+        bot.reply_to(message, ui_err('Something Went Wrong', 'The ban could not be completed. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
 
 
 # ---- 2. Suspend / unsuspend hosting -------------------------------------------------------------------
@@ -10882,7 +12006,7 @@ def process_um_suspend(message):
     admin_id = message.from_user.id
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Suspend cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Suspend cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     try:
         parts = (message.text or '').split(None, 1)
@@ -10892,31 +12016,31 @@ def process_um_suspend(message):
         reason = _um_clean_text(parts[1]) if len(parts) > 1 else ''
         reason = reason or 'Suspended by admin'
         if _um_protected(user_id):
-            bot.reply_to(message, "⚠️ Cannot suspend the owner or an admin.")
+            bot.reply_to(message, ui_warn('Not Allowed', 'Cannot suspend the owner or an admin.', foot='Pick a different user.'), parse_mode='HTML')
             return
         if user_id in suspended_users:
-            bot.reply_to(message, f"ℹ️ User <code>{user_id}</code> is already suspended.", parse_mode='HTML')
+            bot.reply_to(message, ui_info('Already Suspended', ui_row('👤', 'User', user_id, code=True), f"⏸️ Status: {ui_tag('suspended')}", foot='Use Unsuspend to lift it.'), parse_mode='HTML')
             return
         if not suspend_user_db(user_id, reason, admin_id):
-            bot.reply_to(message, "❌ Failed to suspend hosting.")
+            bot.reply_to(message, ui_err('Action Failed', 'Failed to suspend hosting. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
             return
         stopped = _stop_user_scripts(user_id)
         bot.reply_to(message,
-                     f"⏸️ <b>Hosting Suspended</b>\n💎 ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
-                     f"👤 User: <code>{user_id}</code>\n🛑 Scripts stopped: <b>{stopped}</b>\n"
-                     f"📝 Reason: {html_escape(reason)}\n\nNew starts are refused until you unsuspend this user.",
+                     ui_warn('Hosting Suspended', ui_row('👤', 'User', user_id, code=True), f"⏸️ Status: {ui_tag('suspended')}",
+                             ui_row('🛑', 'Scripts stopped', stopped), ui_row('📝', 'Reason', reason),
+                             foot='New starts are refused until you unsuspend this user.'),
                      parse_mode='HTML')
         try:
-            bot.send_message(user_id, f"⏸️ Your hosting has been suspended by an admin.\nReason: {reason}\n"
-                                      "Your files are safe and you can still use the bot, but nothing can run or start "
-                                      "until an admin lifts this.")
+            bot.send_message(user_id, ui_warn('Hosting Suspended', f"⏸️ Status: {ui_tag('suspended')}", ui_row('📝', 'Reason', reason),
+                                              'Your files are safe and you can still use the bot, but nothing can run or start until an admin lifts this.',
+                                              foot='Contact the owner if you want this reviewed.'), parse_mode='HTML')
         except Exception as e:
             logger.error(f"Failed to notify suspended user {user_id}: {e}")
     except ValueError:
         bot.reply_to(message, ui_warn('Invalid User ID', 'The user ID must be a number.'), parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error suspending user: {e}", exc_info=True)
-        bot.reply_to(message, "❌ Something went wrong while suspending. Check the logs.")
+        bot.reply_to(message, ui_err('Something Went Wrong', 'The suspension could not be completed. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
 
 
 def um_unsuspend_callback(call):
@@ -10930,28 +12054,28 @@ def process_um_unsuspend(message):
     admin_id = message.from_user.id
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Unsuspend cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Unsuspend cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     try:
         user_id = int((message.text or '').strip())
         if user_id <= 0: raise ValueError("ID must be positive")
         if user_id not in suspended_users:
-            bot.reply_to(message, f"ℹ️ User <code>{user_id}</code> is not suspended.", parse_mode='HTML')
+            bot.reply_to(message, ui_info('Not Suspended', ui_row('👤', 'User', user_id, code=True), f"▶️ Status: {ui_tag('active')}", foot='Nothing to lift.'), parse_mode='HTML')
             return
         if not unsuspend_user_db(user_id):
-            bot.reply_to(message, "❌ Failed to unsuspend.")
+            bot.reply_to(message, ui_err('Action Failed', 'Failed to unsuspend. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
             return
-        bot.reply_to(message, f"▶️ <b>Hosting Restored</b>\n💎 ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n👤 User: <code>{user_id}</code>\n"
-                              "The user can start scripts again.", parse_mode='HTML')
+        bot.reply_to(message, ui_ok('Hosting Restored', ui_row('👤', 'User', user_id, code=True), f"▶️ Status: {ui_tag('active')}",
+                                    foot='The user can start scripts again.'), parse_mode='HTML')
         try:
-            bot.send_message(user_id, "▶️ Your hosting suspension has been lifted. You can start your scripts again.")
+            bot.send_message(user_id, ui_ok('Hosting Restored', f"▶️ Status: {ui_tag('active')}", 'Your suspension has been lifted.', foot='Open My Files and start your scripts again.'), parse_mode='HTML')
         except Exception as e:
             logger.error(f"Failed to notify unsuspended user {user_id}: {e}")
     except ValueError:
         bot.reply_to(message, ui_warn('Invalid User ID', 'The user ID must be a number.'), parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error unsuspending user: {e}", exc_info=True)
-        bot.reply_to(message, "❌ Something went wrong while unsuspending. Check the logs.")
+        bot.reply_to(message, ui_err('Something Went Wrong', 'Could not lift the suspension. Nothing was changed.', foot='Please try again in a moment.'), parse_mode='HTML')
 
 
 # ---- 3. Bulk actions ---------------------------------------------------------------------------------
@@ -10983,12 +12107,12 @@ def process_um_bulk_ids(message):
     admin_id = message.from_user.id
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Bulk action cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Bulk action cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     try:
         ids, bad = _um_parse_ids(message.text)
         if not ids:
-            bot.reply_to(message, "⚠️ No valid User IDs found. Paste numbers only, then try Bulk Actions again.")
+            bot.reply_to(message, ui_warn('Nothing Found', 'No valid User IDs found.', foot='Paste numbers only, then try Bulk Actions again.'), parse_mode='HTML')
             return
         cut = max(0, len(ids) - BULK_MAX_IDS)
         ids = ids[:BULK_MAX_IDS]
@@ -11011,7 +12135,7 @@ def process_um_bulk_ids(message):
                          parse_mode='HTML', reply_markup=menu)
     except Exception as e:
         logger.error(f"Error reading bulk IDs: {e}", exc_info=True)
-        bot.reply_to(message, "❌ Could not read that list. Try again.")
+        bot.reply_to(message, ui_err('Could Not Read', 'Could not read that list.', foot='Try again.'), parse_mode='HTML')
 
 
 def _um_bulk_ids(admin_id):
@@ -11068,7 +12192,7 @@ def um_bulk_unban_callback(call):
         elif unban_user_db(uid):
             ok.append(uid)
             try:
-                bot.send_message(uid, "✅ Your ban has been lifted. You can now use the bot again.")
+                bot.send_message(uid, ui_ok('Ban Lifted', f"✅ Status: {ui_tag('active')}", 'Your ban has been lifted.', foot='Send /start to continue.'), parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Failed to notify unbanned user {uid}: {e}")
             time.sleep(0.05)
@@ -11092,17 +12216,17 @@ def process_um_bulk_limit(message):
     admin_id = message.from_user.id
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Bulk limit cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Bulk limit cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     try:
         limit = int((message.text or '').strip())
         if not 1 <= limit <= BULK_MAX_LIMIT: raise ValueError("limit out of range")
     except ValueError:
-        bot.reply_to(message, f"⚠️ The limit must be a number from 1 to {BULK_MAX_LIMIT}. Open Bulk Actions to try again.")
+        bot.reply_to(message, ui_warn('Check The Number', f'The limit must be a number from 1 to {BULK_MAX_LIMIT}.', foot='Open Bulk Actions to try again.'), parse_mode='HTML')
         return
     ids = _um_bulk_ids(admin_id)
     if ids is None:
-        bot.reply_to(message, "⚠️ That list expired. Open Bulk Actions and paste the IDs again.")
+        bot.reply_to(message, ui_warn('Session Expired', 'That list expired.', foot='Open Bulk Actions and paste the IDs again.'), parse_mode='HTML')
         return
     BULK_PENDING.pop(admin_id, None)
     ok, failed = [], []
@@ -11560,11 +12684,11 @@ def process_um_search(message):
     admin_id = message.from_user.id
     if admin_id not in admin_ids: bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML'); return
     if message.text and message.text.lower() == '/cancel':
-        bot.reply_to(message, "❌ Search cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Search cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     term = (message.text or '').strip()
     if not SEARCH_MIN_CHARS <= len(term) <= SEARCH_MAX_CHARS:
-        bot.reply_to(message, f"⚠️ The search text must be {SEARCH_MIN_CHARS} to {SEARCH_MAX_CHARS} characters. Open Search Files to try again.")
+        bot.reply_to(message, ui_warn('Check The Search', f'The search text must be {SEARCH_MIN_CHARS} to {SEARCH_MAX_CHARS} characters.', foot='Open Search Files to try again.'), parse_mode='HTML')
         return
     try:
         bot.reply_to(message, "🔍 Searching all hosted files...")
@@ -11597,7 +12721,7 @@ def process_um_search(message):
             bot.send_message(message.chat.id, chunk, parse_mode='HTML', reply_markup=menu if last else None, ui_raw=True)
     except Exception as e:
         logger.error(f"Error in file search: {e}", exc_info=True)
-        bot.reply_to(message, "❌ Something went wrong during the search. Check the logs.")
+        bot.reply_to(message, ui_err('Something Went Wrong', 'Something went wrong during the search.', foot='Check the logs.'), parse_mode='HTML')
 
 
 # --- Hosting Health & Crash Recovery ---
@@ -11692,7 +12816,8 @@ def build_hosting_health_report():
         except Exception:
             backup_lines = []
         return ui_msg('🩺', 'HOSTING HEALTH',
-                      ui_row('🟢', 'Hosting bot', 'Online'),
+                      f"🤖 Hosting bot: {ui_tag('online')}",
+                      f"🛡️ Overall: {ui_tag('warn', 'ATTENTION') if exhausted else ui_tag('ok', 'ALL GOOD')}",
                       ui_section('⚙️', 'Scripts'),
                       ui_row('🚀', 'Running now', running),
                       ui_row('📦', 'Stored scripts', sum(len(v) for v in user_files.values())),
@@ -11702,7 +12827,7 @@ def build_hosting_health_report():
                       ui_row('🧠', 'CPU', cpu_text), _res_bar(cpu_text),
                       ui_row('💾', 'RAM', ram_text), _res_bar(ram_text),
                       ui_row('💿', 'Disk', disk_text), _res_bar(disk_text),
-                      ui_row('⏱️', 'Host uptime', f"{up // 3600}h {(up % 3600) // 60}m"),
+                      ui_row('⏱️', 'Host uptime', ui_uptime(up)),
                       ui_section('🛡️', 'Protection'),
                       ui_row('🛡️', 'Auto-restart', f"maximum {MAX_AUTO_RESTARTS} attempts"),
                       ui_row('⏰', 'Scheduled restart', sched),
@@ -11784,6 +12909,31 @@ def _trim_script_log(info):
         logger.debug("Could not trim log for %s: %s", info.get("script_key"), exc)
 
 
+def _log_tail(info, lines=8, limit=900):
+    """The last few lines of a script's log as plain text ('' when there is none). Never raises."""
+    try:
+        path = os.path.join(info["user_folder"], f"{os.path.splitext(info['file_name'])[0]}.log")
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return ''
+        with open(path, 'rb') as fh:
+            fh.seek(max(0, os.path.getsize(path) - 6000))
+            raw = fh.read().decode('utf-8', errors='ignore')
+        tail = '\n'.join([ln for ln in raw.splitlines() if ln.strip()][-lines:])
+        return tail[-limit:]
+    except Exception:
+        return ''
+
+
+def _crash_card(kind, info, rows, foot):
+    """A crash / restart notice: status badge, short rows and (when there is a log) the last lines in a collapsed quote."""
+    tail = _log_tail(info)
+    parts = [f"📡 Status: {ui_tag('stopped')}", ui_row('📄', 'File', info.get('file_name', '?'), code=True), *rows]
+    if tail:
+        parts += ["👇 Last log lines:", ui_expand(tail, 800)]
+    fn = ui_err if kind == 'err' else ui_warn
+    return fn('Script Stopped', *parts, foot=foot)
+
+
 def _notify_owner(info, text):
     try:
         bot.send_message(int(info["script_owner_id"]), text, parse_mode="HTML")
@@ -11805,24 +12955,28 @@ def _watchdog_plan_retry(key, info, rc, scheduled):
             state["last_error"] = f"exit={rc}"
             logger.warning("%s exited (%s); slow retry %s/%s in %ss", key, rc, slow, RESTART_SLOW_RETRIES, RESTART_SLOW_DELAY)
             if slow == 1:
-                _notify_owner(info, f"⚠️ <code>{name}</code> {MAX_AUTO_RESTARTS} baar restart karne par bhi nahi chala. "
-                                    f"Main har {RESTART_SLOW_DELAY // 60} minute me phir try karta rahunga. Logs check karo.")
+                _notify_owner(info, _crash_card('warn', info,
+                              [f"🔁 {MAX_AUTO_RESTARTS} baar restart karne par bhi nahi chala.",
+                               ui_row('⏱️', 'Next try', f"every {RESTART_SLOW_DELAY // 60} min")],
+                              'Main phir try karta rahunga. Logs check karo, shayad code me error hai.'))
             scheduled[key] = (time.time() + RESTART_SLOW_DELAY, info, attempts)
             return
         state["last_error"] = f"exit={rc}; retry limit reached"
         logger.error("Restart limit reached for %s (exit=%s)", key, rc)
         if not SHUTDOWN_EVENT.is_set():
             autostart_clear(key)       # given up: a reboot does not start a script that crashes every time
-        _notify_owner(info, f"❌ <code>{name}</code> stopped. "
-                            f"Auto-restart limit ({MAX_AUTO_RESTARTS}) reached. Check logs.")
+        _notify_owner(info, _crash_card('err', info,
+                      [ui_row('🔁', 'Auto-restart', f"limit ({MAX_AUTO_RESTARTS}) reached")],
+                      'Fix the error from the log, then tap Start in My Files.'))
         return
     attempts += 1
     state["attempts"] = attempts
     state["last_error"] = f"exit={rc}"
     delay = RESTART_BACKOFF[min(attempts - 1, len(RESTART_BACKOFF) - 1)]
     logger.warning("%s exited (%s); retry %s/%s in %ss", key, rc, attempts, MAX_AUTO_RESTARTS, delay)
-    _notify_owner(info, f"⚠️ <code>{name}</code> stopped unexpectedly. "
-                        f"Auto-restart {attempts}/{MAX_AUTO_RESTARTS} in {delay}s.")
+    _notify_owner(info, _crash_card('warn', info,
+                  ["Stopped unexpectedly.", ui_row('🔁', 'Auto-restart', f"{attempts}/{MAX_AUTO_RESTARTS} in {delay}s")],
+                  'No action needed, it comes back by itself.'))
     scheduled[key] = (time.time() + delay, info, attempts)
 
 
@@ -12032,7 +13186,7 @@ def retry_failed_scripts(admin_id, chat_id):
             if state.get("attempts", 0) >= MAX_AUTO_RESTARTS and os.path.isfile(os.path.join(folder, file_name)):
                 retryable.append((owner_id, file_name, file_type, folder))
     if not retryable:
-        bot.send_message(chat_id, "✅ No failed scripts are waiting for retry.")
+        bot.send_message(chat_id, ui_ok('All Clear', 'No failed scripts are waiting for retry.'), parse_mode='HTML')
         return
     pm = ui_anim(chat_id, 'Retry Failed Bots', 'Starting the failed scripts again...', done=0, total=len(retryable))
     try:
@@ -12082,7 +13236,7 @@ def restart_all_scripts(admin_id, chat_id):
                     continue
                 seen.add(key)
         if not targets:
-            bot.send_message(chat_id, "ℹ️ No hosted scripts found to restart.")
+            bot.send_message(chat_id, ui_info('Nothing To Restart', 'No hosted scripts found to restart.'), parse_mode='HTML')
             return
         logger.info("Admin %s started 'restart all' for %s script(s)", admin_id, len(targets))
         pm = ui_anim(chat_id, 'Restart All Bots', f"Restarting {len(targets)} script(s) of all users. Please wait...",
@@ -12181,7 +13335,7 @@ def system_info_callback(call):
                  ui_row('✨', 'Version', f"{BOT_VERSION} Premium"),
                  ui_row('🐍', 'Python', platform.python_version()),
                  ui_row('🖥️', 'Platform', platform.platform()),
-                 ui_row('⏱️', 'Bot uptime', time.strftime('%H:%M:%S', time.gmtime(up))),
+                 ui_row('⏱️', 'Bot uptime', ui_uptime(up)),
                  ui_section('💻', 'System')]
         try:
             cpu_text, ram_text = _safe_cpu_health(), _safe_memory_health()
@@ -12201,7 +13355,7 @@ def system_info_callback(call):
                   ui_row('👥', 'Active users', len(active_users)),
                   ui_row('🚀', 'Running scripts', len(bot_scripts)),
                   ui_row('📦', 'Total files', sum(len(files) for files in user_files.values())),
-                  ui_row('🔐', 'Bot status', '🔒 Locked' if bot_locked else '🔓 Unlocked')]
+                  f"🔐 Bot status: {ui_tag('locked') if bot_locked else ui_tag('unlocked')}"]
         try:
             for line in auto_backup_status_lines():
                 lines.append(ui_row('💾', 'Auto backup', re.sub(r'^Auto backup:\s*', '', line.lstrip('•- ').strip())))
@@ -12218,7 +13372,8 @@ def bot_performance_callback(call):
     try:
         running_scripts = len(bot_scripts)
         total_files = sum(len(files) for files in user_files.values())
-        lines = [ui_section('🚀', 'Scripts'),
+        lines = [f"📡 Engine: {ui_tag('active') if running_scripts else ui_tag('off', 'IDLE')}",
+                 ui_section('🚀', 'Scripts'),
                  ui_row('⚡', 'Running', running_scripts),
                  ui_row('📦', 'Total', total_files),
                  ui_row('📈', 'Running ratio', f"{running_scripts}/{total_files} ({running_scripts / total_files * 100:.1f}%)" if total_files else "0/0 (N/A)")]
@@ -12231,7 +13386,8 @@ def bot_performance_callback(call):
             lines += [ui_section('💾', 'Resource Usage'),
                       ui_row('💾', 'Memory', f"{memory_usage:.1f} MB"),
                       ui_row('🧠', 'CPU', f"{cpu_usage:.1f}%"),
-                      f"<code>{ui_bar(min(cpu_usage, 100), 100)}</code>"]
+                      f"<code>{ui_bar(min(cpu_usage, 100), 100)}</code>",
+                      f"🚦 Load: {ui_tag('ok', 'LIGHT') if cpu_usage < 60 else (ui_tag('warn', 'BUSY') if cpu_usage < 85 else ui_tag('stopped', 'HEAVY'))}"]
         except Exception as e:
             logger.warning("Resource stats failed: %s", e)
             lines.append(ui_warn_line('Resource stats are not available right now'))
@@ -12337,9 +13493,9 @@ def manage_mandatory_channels_callback(call):
     """Handle mandatory channels management request"""
     bot.answer_callback_query(call.id)
     try:
-        bot.edit_message_text("📢 Manage Mandatory Channels\nChoose desired action:",
-                              call.message.chat.id, call.message.message_id, 
-                              reply_markup=create_mandatory_channels_menu())
+        bot.edit_message_text(_channels_card(),
+                              call.message.chat.id, call.message.message_id,
+                              reply_markup=create_mandatory_channels_menu(), parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error showing channel management menu: {e}")
 
@@ -12349,15 +13505,12 @@ def add_mandatory_channel_callback(call):
         bot.answer_callback_query(call.id, ui_toast('err', 'Admin permissions required.'), show_alert=True)
         return
     bot.answer_callback_query(call.id)
-    prompt = (
-        "📢 <b>Add Force-Join Channel</b>\n\n"
-        "Send one of these: <code>@public_channel</code>, "
-        "<code>https://t.me/public_channel</code>, or numeric channel ID "
-        "such as <code>-1001234567890</code>.\n\n"
-        "<b>Important:</b> Add this bot as an administrator in the channel first.\n"
-        "Private channels require their numeric ID; send the invite link separately to users if needed.\n\n"
-        "Send /cancel to stop."
-    )
+    prompt = ui_msg('📢', 'Add Force-Join Channel',
+                    'Send one of these: <code>@public_channel</code>, <code>https://t.me/public_channel</code>, '
+                    'or numeric channel ID such as <code>-1001234567890</code>.',
+                    "🟡 <b>Important:</b> Add this bot as an administrator in the channel first.",
+                    'Private channels require their numeric ID; the invite link is asked next.',
+                    foot='Send /cancel to stop.')
     msg = bot.send_message(call.message.chat.id, prompt, parse_mode='HTML')
     bot.register_next_step_handler(msg, process_add_channel)
 
@@ -12389,17 +13542,17 @@ def process_add_channel(message):
         bot.reply_to(message, MSG_NO_ADMIN, parse_mode='HTML')
         return
     if not message.text:
-        bot.reply_to(message, "❌ Please send channel username, link, or numeric ID as text.\n/cancel to cancel")
+        bot.reply_to(message, ui_warn('Text Needed', 'Please send the channel username, link, or numeric ID as text.', foot='Send /cancel to cancel.'), parse_mode='HTML')
         return
     if message.text.strip().lower() == '/cancel':
-        bot.reply_to(message, "❌ Channel addition cancelled.")
+        bot.reply_to(message, ui_info('Cancelled', 'Channel addition cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
 
     try:
         channel_identifier = _normalize_channel_identifier(message.text)
         chat = bot.get_chat(channel_identifier)
         if getattr(chat, 'type', None) not in ('channel', 'supergroup'):
-            bot.reply_to(message, "❌ This is not a Telegram channel/supergroup. Send a channel username or channel ID.")
+            bot.reply_to(message, ui_warn('Not A Channel', 'This is not a Telegram channel or supergroup.', foot='Send a channel username or channel ID.'), parse_mode='HTML')
             return
 
         channel_id = str(chat.id)
@@ -12412,17 +13565,15 @@ def process_add_channel(message):
             logger.warning('Cannot inspect bot membership in channel %s: %s', channel_id, permission_error, exc_info=True)
             bot.reply_to(
                 message,
-                "❌ <b>Bot cannot access this channel.</b>\n\n"
-                "1. Add the bot to the channel.\n"
-                "2. Promote it to administrator.\n"
-                "3. Retry using the channel's @username or -100 channel ID.\n\n"
-                f"<i>Telegram says:</i> <code>{html_escape(str(permission_error)[:350])}</code>",
+                ui_err('Bot Cannot Access This Channel',
+                       ui_steps('Add the bot to the channel', 'Promote it to administrator', "Retry using the channel's @username or -100 channel ID"),
+                       ui_row('💬', 'Telegram says', str(permission_error)[:350], code=True, bold=False)),
                 parse_mode='HTML'
             )
             return
 
         if getattr(bot_member, 'status', None) not in ('administrator', 'creator'):
-            bot.reply_to(message, "❌ Bot is not an administrator in this channel. Promote the bot and try again.")
+            bot.reply_to(message, ui_warn('Bot Is Not Admin', 'The bot is not an administrator in this channel.', foot='Promote the bot to admin there and try again.'), parse_mode='HTML')
             return
 
         if not channel_username:
@@ -12435,9 +13586,8 @@ def process_add_channel(message):
             }
             prompt = bot.reply_to(
                 message,
-                "🔗 <b>Private channel detected.</b> Send its invite link now "
-                "(<code>https://t.me/+...</code> or <code>https://t.me/joinchat/...</code>).\n"
-                "Send /cancel to abort.",
+                ui_info('Private Channel Detected', 'Send its invite link now (<code>https://t.me/+...</code> or <code>https://t.me/joinchat/...</code>).',
+                        foot='Send /cancel to abort.'),
                 parse_mode='HTML'
             )
             bot.register_next_step_handler(prompt, process_private_channel_invite)
@@ -12446,17 +13596,16 @@ def process_add_channel(message):
         if save_mandatory_channel(channel_id, channel_username, channel_name, admin_id):
             bot.reply_to(
                 message,
-                f"✅ <b>Force-join channel added successfully!</b>\n\n"
-                f"📢 <b>{html_escape(channel_name)}</b>\n"
-                f"🆔 <code>{channel_id}</code>\n"
-                f"🔗 {html_escape(channel_username)}",
+                ui_ok('Channel Added', f"🔒 Join gate: {ui_tag('active', 'ENFORCED')}", ui_row('📢', 'Channel', channel_name),
+                      ui_row('🆔', 'ID', channel_id, code=True), ui_row('🔗', 'Link', channel_username),
+                      foot='New users must join it before using the bot.'),
                 parse_mode='HTML',
                 reply_markup=create_mandatory_channels_menu()
             )
         else:
-            bot.reply_to(message, "❌ Database could not save this channel. Check hosting logs and database write permissions.")
+            bot.reply_to(message, ui_err('Could Not Save', 'The database could not save this channel.', foot='Check hosting logs and database write permissions.'), parse_mode='HTML')
     except ValueError as exc:
-        bot.reply_to(message, f"❌ {html_escape(str(exc))}", parse_mode='HTML')
+        bot.reply_to(message, ui_warn('Check The Channel', html_escape(str(exc)), foot='Send the channel again or /cancel.'), parse_mode='HTML')
     except Exception as exc:
         logger.error('Error adding mandatory channel: %s', exc, exc_info=True)
         error_text = str(exc)
@@ -12466,39 +13615,38 @@ def process_add_channel(message):
             hint = 'Bot needs administrator access in that channel.'
         else:
             hint = 'Could not add this channel. Verify the channel ID/username and bot admin permissions.'
-        bot.reply_to(message, f"❌ <b>{html_escape(hint)}</b>\n<code>{html_escape(error_text[:350])}</code>", parse_mode='HTML')
+        bot.reply_to(message, ui_err('Channel Not Added', hint, ui_row('💬', 'Telegram says', error_text[:350], code=True, bold=False), foot='Fix it and try Channel Add again.'), parse_mode='HTML')
 
 def process_private_channel_invite(message):
     admin_id = message.from_user.id
     pending = pending_channel_add.get(admin_id)
     if admin_id not in admin_ids or not pending:
-        bot.reply_to(message, '⚠️ This channel setup has expired. Start again from Channel Add.')
+        bot.reply_to(message, ui_warn('Setup Expired', 'This channel setup has expired.', foot='Start again from Channel Add.'), parse_mode='HTML')
         return
     if not message.text:
-        bot.reply_to(message, '❌ Send the private invite URL as text, or /cancel.')
+        bot.reply_to(message, ui_warn('Text Needed', 'Send the private invite URL as text.', foot='Or send /cancel to stop.'), parse_mode='HTML')
         bot.register_next_step_handler(message, process_private_channel_invite)
         return
     value = message.text.strip()
     if value.lower() == '/cancel':
         pending_channel_add.pop(admin_id, None)
-        bot.reply_to(message, '❌ Private channel setup cancelled.')
+        bot.reply_to(message, ui_info('Cancelled', 'Private channel setup cancelled. Nothing was changed.', foot='Use the menu to continue.'), parse_mode='HTML')
         return
     if not re.match(r'^https?://(?:www\.)?t\.me/(?:\+[^/\s]+|joinchat/[^/\s]+)(?:\?.*)?$', value, re.I):
-        bot.reply_to(message, '❌ Invalid invite link. Use https://t.me/+... or https://t.me/joinchat/....')
+        bot.reply_to(message, ui_warn('Invalid Invite Link', 'That does not look like an invite link.', foot='Use https://t.me/+... or https://t.me/joinchat/... or send /cancel.'), parse_mode='HTML')
         bot.register_next_step_handler(message, process_private_channel_invite)
         return
     pending_channel_add.pop(admin_id, None)
     if save_mandatory_channel(pending['channel_id'], '', pending['name'], admin_id, invite_link=value):
         bot.reply_to(
             message,
-            f"✅ <b>Private force-join channel added!</b>\n\n"
-            f"📢 <b>{html_escape(pending['name'])}</b>\n"
-            f"🆔 <code>{pending['channel_id']}</code>\n"
-            f"🔗 {html_escape(value)}",
+            ui_ok('Private Channel Added', f"🔒 Join gate: {ui_tag('active', 'ENFORCED')}", ui_row('📢', 'Channel', pending['name']),
+                  ui_row('🆔', 'ID', pending['channel_id'], code=True), ui_row('🔗', 'Invite', value),
+                  foot='New users must join it before using the bot.'),
             parse_mode='HTML', reply_markup=create_mandatory_channels_menu()
         )
     else:
-        bot.reply_to(message, '❌ Database could not save this channel. Check hosting logs.')
+        bot.reply_to(message, ui_err('Could Not Save', 'The database could not save this channel.', foot='Check hosting logs and try again.'), parse_mode='HTML')
 
 
 def remove_mandatory_channel_callback(call):
@@ -12520,9 +13668,10 @@ def remove_mandatory_channel_callback(call):
     markup.add(NavButton("🔙 Back", callback_data='manage_mandatory_channels'))
     
     try:
-        bot.edit_message_text("📢 Choose channel to delete:" + _page_note(page, pages),
-                              call.message.chat.id, call.message.message_id, 
-                              reply_markup=markup)
+        bot.edit_message_text(ui_msg('🗑️', 'Remove Channel', ui_row('📢', 'Channels', ui_num(len(mandatory_channels))),
+                                     foot='Tap a channel below to remove it from the join gate.' + _page_note(page, pages)),
+                              call.message.chat.id, call.message.message_id,
+                              reply_markup=markup, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error showing remove channel menu: {e}")
 
@@ -12535,7 +13684,8 @@ def process_remove_channel(call):
         if remove_mandatory_channel_db(channel_id):
             bot.answer_callback_query(call.id, f"✅ Channel deleted: {channel_name}")
             try:
-                bot.edit_message_text(f"✅ Mandatory channel deleted: <b>{html_escape(str(channel_name))}</b>",
+                bot.edit_message_text(ui_ok('Channel Removed', ui_row('📢', 'Channel', channel_name), ui_row('📢', 'Left', ui_num(len(mandatory_channels))),
+                                            foot='Users no longer need to join it.'),
                                       call.message.chat.id, call.message.message_id,
                                       reply_markup=create_mandatory_channels_menu(), parse_mode='HTML')
             except Exception as e:
@@ -12550,17 +13700,23 @@ def list_mandatory_channels_callback(call):
     bot.answer_callback_query(call.id)
     
     if not mandatory_channels:
-        message_text = "📢 **No mandatory channels currently**"
+        message_text = ui_msg('📢', 'Mandatory Channels', f"🔒 Join gate: {ui_tag('off', 'NOT SET')}",
+                              '🌱 No mandatory channels yet.', foot='Tap Add Channel to require users to join one.')
     else:
-        message_text = "📢 **Mandatory Channels:**\n\n"
-        for channel_id, channel_info in list(mandatory_channels.items()):
+        items = list(mandatory_channels.items())
+        lines = []
+        for channel_id, channel_info in items[:20]:
             channel_name = channel_info.get('name', 'Unknown')
-            channel_username = channel_info.get('username', 'No username')
-            message_text += f"• **{channel_name}**\n  {channel_username or channel_id}\n\n"
-    
+            channel_username = channel_info.get('username') or channel_id
+            lines.append(f"📢 <b>{ui_esc(str(channel_name)[:60])}</b>\n    <code>{ui_esc(str(channel_username)[:60])}</code>")
+        if len(items) > 20:
+            lines.append(f"<i>+{len(items) - 20} more</i>")
+        message_text = ui_msg('📢', 'Mandatory Channels', f"🔒 Join gate: {ui_tag('active', 'ENFORCED')}",
+                              ui_row('📢', 'Channels', ui_num(len(items))), *lines, foot='Users must join all of these to use the bot.')
+
     try:
         bot.edit_message_text(message_text, call.message.chat.id, call.message.message_id,
-                              reply_markup=create_mandatory_channels_menu(), parse_mode='Markdown')
+                              reply_markup=create_mandatory_channels_menu(), parse_mode='HTML')
     except Exception as e:
         logger.error(f"Error listing channels: {e}")
 
