@@ -207,7 +207,7 @@ REFERRAL_REWARD_DAYS = max(1, _env_int('REFERRAL_REWARD_DAYS', 7))
 PENDING_REFERRALS = {}                   # new user id -> referrer id, kept until the user passes the channel check
 BOT_USERNAME_CACHE = {'name': ''}
 HOST_START_TIME = time.time()
-BOT_VERSION = 'v19'                      # shown in the start-up log, /health and Bot Information: tells which code really runs
+BOT_VERSION = 'v21'                      # shown in the start-up log, /health and Bot Information: tells which code really runs
 SHUTDOWN_EVENT = threading.Event()
 HEALTH_STATE = {'last_poll_start': None, 'poll_restarts': 0, 'last_error': ''}
 user_subscriptions = {}
@@ -4279,8 +4279,8 @@ SQLITE_MAGIC = b'SQLite format 3\x00'
 BACKUP_SKIP_DIRS = {'node_modules', '__pycache__', 'venv', 'env', 'site-packages', '.git'}
 BACKUP_SKIP_SUFFIXES = ('.log', '.pyc', '-wal', '-shm', '-journal')
 HOSTING_DB_CORE_TABLES = ('subscriptions', 'user_files', 'active_users', 'admins')
-FULL_BACKUP_MAX_MB = _env_int('FULL_BACKUP_MAX_MB', 2048)    # total size of a full backup before compression
-USER_BACKUP_MAX_MB = _env_int('USER_BACKUP_MAX_MB', 500)     # same, for one user's backup
+FULL_BACKUP_MAX_MB = _env_int('FULL_BACKUP_MAX_MB', 760)    # total size of a full backup before compression
+USER_BACKUP_MAX_MB = _env_int('USER_BACKUP_MAX_MB', 760)     # same, for one user's backup
 BACKUP_MAX_FILES = _env_int('BACKUP_MAX_FILES', 50000)
 IMPORT_TTL = 600                                             # seconds a pending upload / confirmation stays valid
 # Telegram lets a bot read files up to 20 MB, so bigger backups are sent in parts that fit that limit.
@@ -5135,9 +5135,31 @@ def _receive_backup_upload(message, pend):
         with open(part_path, 'wb') as handle:
             handle.write(content)
         pend['parts'][number] = part_path
-        have = ', '.join(str(n) for n in sorted(pend['parts']))
-        _say(chat_id, f'✅ Part {number} received. Parts so far: {have}.\n'
-                      'Send the next part, or tap <b>Done</b> when you have sent all of them.', _parts_markup())
+        have_numbers = sorted(pend['parts'])
+        have = ', '.join(str(n) for n in have_numbers)
+        missing = [n for n in range(1, have_numbers[-1] + 1) if n not in pend['parts']]
+        # Every part except the last is exactly PART_BYTES long, so the size tells whether more parts are coming.
+        is_last = len(content) < PART_BYTES
+        if is_last:
+            pend['last_part'] = number
+        last_known = pend.get('last_part')
+        if missing:
+            need = ', '.join(f'<code>.zip.{n:03d}</code>' for n in missing[:12])
+            body = (f'✅ Part {number} received. Parts so far: {have}.\n'
+                    f'⏳ <b>Still missing:</b> {need}. Send {"it" if len(missing) == 1 else "them"} now.')
+        elif is_last or (last_known and last_known == have_numbers[-1]):
+            body = (f'✅ Part {number} received. Parts so far: {have}.\n'
+                    f'🎉 This was the last part and nothing is missing ({len(have_numbers)} parts in total). '
+                    'Tap <b>Done, check backup</b> now.')
+        elif last_known and have_numbers[-1] < last_known:
+            body = (f'✅ Part {number} received. Parts so far: {have}.\n'
+                    f'⏳ <b>More parts are still to come.</b> Send <code>.zip.{have_numbers[-1] + 1:03d}</code> next.')
+        else:
+            body = (f'✅ Part {number} received. Parts so far: {have}.\n'
+                    f'⏳ <b>More parts are still to come</b> (this one is full size, so it is not the last). '
+                    f'Send <code>.zip.{have_numbers[-1] + 1:03d}</code> next. '
+                    'If you have already sent every part, tap <b>Done, check backup</b>.')
+        _say(chat_id, body, _parts_markup())
         return
     with IMPORT_LOCK:
         PENDING_IMPORT_WAIT.pop(uid, None)
