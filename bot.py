@@ -207,7 +207,7 @@ REFERRAL_REWARD_DAYS = max(1, _env_int('REFERRAL_REWARD_DAYS', 7))
 PENDING_REFERRALS = {}                   # new user id -> referrer id, kept until the user passes the channel check
 BOT_USERNAME_CACHE = {'name': ''}
 HOST_START_TIME = time.time()
-BOT_VERSION = 'v21'                      # shown in the start-up log, /health and Bot Information: tells which code really runs
+BOT_VERSION = 'v22'                      # shown in the start-up log, /health and Bot Information: tells which code really runs
 SHUTDOWN_EVENT = threading.Event()
 HEALTH_STATE = {'last_poll_start': None, 'poll_restarts': 0, 'last_error': ''}
 user_subscriptions = {}
@@ -4328,13 +4328,35 @@ def _human_size(num):
         num /= 1024
 
 
-def _safe_zip_rel(rel):
+BACKUP_MAX_REL = 1500       # longest path inside a backup (deep folders, e.g. another hosting bot hosted here, are fine)
+BACKUP_MAX_REL_EXPORT = 1400  # export keeps this much room for the 'upload_bots/<id>/' prefix, so what is exported can be imported
+
+
+def _safe_zip_rel(rel, max_len=BACKUP_MAX_REL):
     """A zip entry / relative path that stays inside its folder: no absolute path, no '..', no backslash."""
-    if not rel or len(rel) > 400 or any(ord(ch) < 32 for ch in rel):
+    if not rel or len(rel) > max_len or any(ord(ch) < 32 for ch in rel):
         return False
     if rel.startswith('/') or '\\' in rel or (len(rel) > 1 and rel[1] == ':'):
         return False
-    return all(part not in ('', '.', '..') and len(part) <= 200 for part in rel.split('/'))
+    return all(part not in ('', '.', '..') and len(part) <= 255 for part in rel.split('/'))
+
+
+def _unsafe_why(rel):
+    """Short plain reason why _safe_zip_rel refused a path (shown to the owner)."""
+    if not rel:
+        return 'empty name'
+    if len(rel) > BACKUP_MAX_REL:
+        return f'path longer than {BACKUP_MAX_REL} characters'
+    if any(ord(ch) < 32 for ch in rel):
+        return 'control character in the name'
+    if rel.startswith('/') or '\\' in rel or (len(rel) > 1 and rel[1] == ':'):
+        return 'absolute path or backslash'
+    for part in rel.split('/'):
+        if part in ('', '.', '..'):
+            return 'empty, . or .. folder name'
+        if len(part) > 255:
+            return 'a single name longer than 255 characters'
+    return 'not allowed'
 
 
 def _expire_pending_imports():
@@ -4499,7 +4521,7 @@ def _iter_backup_files(folder):
             if os.path.islink(full) or not os.path.isfile(full):
                 continue
             rel = os.path.relpath(full, root).replace(os.sep, '/')
-            if _safe_zip_rel(rel):
+            if _safe_zip_rel(rel, BACKUP_MAX_REL_EXPORT):
                 yield rel, full
 
 
@@ -4682,7 +4704,8 @@ def _extract_backup_zip(zip_path, payload_dir, rel_ok, max_bytes, skip_rel=None,
             for item in items:
                 rel = item.filename
                 if not _safe_zip_rel(rel):
-                    return None, f'The backup contains an unsafe path: {rel[:60]!r}.'
+                    return None, (f'The backup contains an unsafe path: {rel[:60]!r}... '
+                                  f'({len(rel)} characters; {_unsafe_why(rel)}).')
                 if item.flag_bits & 0x1:
                     return None, 'The backup is password protected.'
                 if ((item.external_attr >> 16) & 0o170000) == 0o120000:
